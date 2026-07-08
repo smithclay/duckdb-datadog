@@ -29,13 +29,35 @@ static string NormalizeSite(const string &raw) {
 	return s.empty() ? "datadoghq.com" : s;
 }
 
+static string BuildBaseUrl(const string &site) {
+	return "https://api." + NormalizeSite(site);
+}
+
+// Defined here, where `Client` is complete, so the header's unique_ptr<Client> member can point at
+// a forward-declared type. Every special member the compiler might instantiate at a use site (where
+// Client is still incomplete) must be out-of-line: the default constructor and the destructor. The
+// destructor uses an empty body rather than `= default` to keep clang-tidy's
+// performance-trivially-destructible check quiet.
+DatadogClient::DatadogClient() = default;
+DatadogClient::~DatadogClient() {
+}
+
+duckdb_httplib_openssl::Client &DatadogClient::GetConnection() const {
+	if (!connection) {
+		connection = make_uniq<duckdb_httplib_openssl::Client>(BuildBaseUrl(site));
+		connection->set_connection_timeout(static_cast<time_t>(timeout_seconds), 0);
+		connection->set_read_timeout(static_cast<time_t>(timeout_seconds), 0);
+		// Keep the socket open between requests so cursor pagination reuses one TCP+TLS connection
+		// instead of handshaking per page. cpp-httplib defaults keep-alive off.
+		connection->set_keep_alive(true);
+		// No set_follow_location: the endpoint is a fixed POST; following a 3xx would forward the
+		// DD-API-KEY/DD-APPLICATION-KEY headers to the redirect target and mask real non-2xx errors.
+	}
+	return *connection;
+}
+
 string DatadogClient::SearchLogs(const string &request_body_json) const {
-	const string base_url = "https://api." + NormalizeSite(site);
-	duckdb_httplib_openssl::Client client(base_url);
-	client.set_connection_timeout(static_cast<time_t>(timeout_seconds), 0);
-	client.set_read_timeout(static_cast<time_t>(timeout_seconds), 0);
-	// No set_follow_location: the endpoint is a fixed POST; following a 3xx would forward the
-	// DD-API-KEY/DD-APPLICATION-KEY headers to the redirect target and mask real non-2xx errors.
+	auto &client = GetConnection();
 
 	duckdb_httplib_openssl::Headers headers = {
 	    {"DD-API-KEY", api_key},
@@ -43,10 +65,9 @@ string DatadogClient::SearchLogs(const string &request_body_json) const {
 	    {"Accept", "application/json"},
 	};
 
-	auto response =
-	    client.Post("/api/v2/logs/events/search", headers, request_body_json, "application/json");
+	auto response = client.Post("/api/v2/logs/events/search", headers, request_body_json, "application/json");
 	if (!response) {
-		throw IOException("Datadog API request to %s failed: %s", base_url,
+		throw IOException("Datadog API request to %s failed: %s", BuildBaseUrl(site),
 		                  duckdb_httplib_openssl::to_string(response.error()));
 	}
 	if (response->status < 200 || response->status >= 300) {

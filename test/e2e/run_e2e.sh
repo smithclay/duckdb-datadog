@@ -113,8 +113,12 @@ SQL_FILE="$(mktemp -t duckdb_datadog_e2e.XXXXXX.sql)"
 chmod 600 "${SQL_FILE}"
 
 run_duckdb_scalar() { # $1 = SQL producing a single value
+	# `.output /dev/null` around CREATE SECRET suppresses its `Success = true` result row,
+	# which would otherwise be prepended to (and corrupt) the scalar value we read back.
 	cat > "${SQL_FILE}" <<SQL
+.output /dev/null
 CREATE OR REPLACE SECRET dd_e2e (TYPE datadog, API_KEY '${DD_API_KEY}', APP_KEY '${DD_APP_KEY}', SITE '${DD_SITE}');
+.output
 $1
 SQL
 	"${DUCKDB_BIN}" -unsigned -noheader -list -init /dev/null < "${SQL_FILE}"
@@ -142,25 +146,37 @@ ok "read_datadog_logs returned the log (matches=${count})"
 # ---------------------------------------------------------------------------
 # 3. Assert the row is OTLP-shaped and mapped correctly
 # ---------------------------------------------------------------------------
-column_count="$(run_duckdb_scalar "SELECT count(*) FROM (DESCRIBE SELECT * FROM read_datadog_logs(query => '${DD_QUERY}', \"from\" => 'now-15m', \"to\" => 'now'));" | tr -d '[:space:]')"
+# Materialize the matching rows once into a temp table, then run every assertion against that local
+# table. Fetching once (rather than a separate scan per assertion) keeps the test simple and light
+# on the rate-limited search API; the extension itself retries transient HTTP 429s.
+cat > "${SQL_FILE}" <<SQL
+.output /dev/null
+CREATE OR REPLACE SECRET dd_e2e (TYPE datadog, API_KEY '${DD_API_KEY}', APP_KEY '${DD_APP_KEY}', SITE '${DD_SITE}');
+CREATE TEMP TABLE e2e_rows AS SELECT * FROM read_datadog_logs(query => '${DD_QUERY}', "from" => 'now-15m', "to" => 'now');
+.output
+SELECT (SELECT count(*) FROM (DESCRIBE e2e_rows))::VARCHAR || '|' ||
+  (SELECT (count(*) >= 1
+    AND bool_and(service_name = 'duckdb-datadog-e2e')
+    AND bool_and(severity_text = 'info')
+    AND bool_and(severity_number = 9)
+    AND bool_and(body LIKE '%${MARKER}%')
+    AND bool_and(time_unix_nano IS NOT NULL)) FROM e2e_rows)::VARCHAR;
+.print ---SAMPLE---
+SELECT time_unix_nano, service_name, severity_text, severity_number, body FROM e2e_rows LIMIT 1;
+SQL
+assert_out="$("${DUCKDB_BIN}" -unsigned -noheader -list -init /dev/null < "${SQL_FILE}")"
+
+summary_line="$(printf '%s\n' "${assert_out}" | head -n1 | tr -d '[:space:]')"
+column_count="${summary_line%%|*}"
+checks="${summary_line##*|}"
+
 [ "${column_count}" = "18" ] || fail "expected 18 OTLP columns, got '${column_count}'"
 ok "output schema has the 18 OTLP columns"
-
-checks_sql="SELECT
-  (count(*) >= 1)
-  AND bool_and(service_name = 'duckdb-datadog-e2e')
-  AND bool_and(severity_text = 'info')
-  AND bool_and(severity_number = 9)
-  AND bool_and(body LIKE '%${MARKER}%')
-  AND bool_and(time_unix_nano IS NOT NULL)
-FROM read_datadog_logs(query => '${DD_QUERY}', \"from\" => 'now-15m', \"to\" => 'now');"
-checks="$(run_duckdb_scalar "${checks_sql}" | tr -d '[:space:]')"
 [ "${checks}" = "true" ] || fail "row content assertions failed (got '${checks}')"
 ok "row content maps correctly (service_name, severity, body, timestamp)"
 
 log "Sample row:"
-run_duckdb_scalar "SELECT time_unix_nano, service_name, severity_text, severity_number, body
-FROM read_datadog_logs(query => '${DD_QUERY}', \"from\" => 'now-15m', \"to\" => 'now') LIMIT 1;" || true
+printf '%s\n' "${assert_out}" | sed -n '/---SAMPLE---/,$p' | tail -n +2
 
 # ---------------------------------------------------------------------------
 # 4. Independent cross-check via pup (optional)

@@ -6,3 +6,10 @@ duckdb_unittest_tempdir/
 testext
 test/python/__pycache__/
 .Rhistory
+
+# clangd / cmake compile cache
+.cache/
+
+# local Datadog e2e credentials (never commit)
+.dd_e2e.env
+.env

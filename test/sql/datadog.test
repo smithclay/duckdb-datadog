@@ -1,0 +1,59 @@
+# name: test/sql/datadog.test
+# description: test the datadog extension (offline: load, secret, registration, error paths)
+# group: [datadog]
+
+# Before the extension is loaded the table function does not exist.
+statement error
+SELECT * FROM read_datadog_logs(query => '*', "from" => 'now-15m', "to" => 'now');
+----
+does not exist
+
+require datadog
+
+# The reader is registered.
+query I
+SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'read_datadog_logs';
+----
+true
+
+# Calling it without any datadog secret gives a helpful error (this only binds; no network call).
+statement error
+SELECT * FROM read_datadog_logs(query => '*', "from" => 'now-15m', "to" => 'now');
+----
+No 'datadog' secret found
+
+# The custom secret type works.
+statement ok
+CREATE SECRET dd_test (
+    TYPE datadog,
+    API_KEY 'SECRET_API_KEY_VALUE',
+    APP_KEY 'SECRET_APP_KEY_VALUE',
+    SITE 'datadoghq.eu'
+);
+
+query I
+SELECT type FROM duckdb_secrets() WHERE name = 'dd_test';
+----
+datadog
+
+# API/APP keys are redacted, never shown in duckdb_secrets().
+query I
+SELECT secret_string NOT LIKE '%SECRET_API_KEY_VALUE%' AND secret_string NOT LIKE '%SECRET_APP_KEY_VALUE%'
+FROM duckdb_secrets() WHERE name = 'dd_test';
+----
+true
+
+# With a secret present, binding succeeds and exposes the OTLP-conformant schema (bind only, no
+# network call is made until the scan runs).
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_datadog_logs(query => '*', "from" => 'now-15m', "to" => 'now'));
+----
+18
+
+# Key OTLP columns are present (order-independent).
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_datadog_logs(query => '*', "from" => 'now-15m', "to" => 'now'))
+WHERE column_name IN ('time_unix_nano', 'observed_time_unix_nano', 'trace_id', 'span_id', 'severity_number',
+                      'severity_text', 'body', 'resource_attributes', 'log_attributes', 'flags');
+----
+10

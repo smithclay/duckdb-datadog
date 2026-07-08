@@ -1,6 +1,6 @@
 # name: test/sql/datadog.test
 # description: test the datadog extension (offline: load, secret, registration, error paths)
-# group: [datadog]
+# group: [sql]
 
 # Before the extension is loaded the table function does not exist.
 statement error

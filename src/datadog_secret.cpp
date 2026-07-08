@@ -58,9 +58,9 @@ DatadogCredentials GetDatadogCredentials(ClientContext &context, const string &s
 			}
 		}
 		if (!entry) {
-			throw InvalidInputException(
-			    "No 'datadog' secret found. Create one first, e.g.:\n"
-			    "  CREATE SECRET (TYPE datadog, API_KEY '<dd-api-key>', APP_KEY '<dd-app-key>', SITE 'datadoghq.com');");
+			throw InvalidInputException("No 'datadog' secret found. Create one first, e.g.:\n"
+			                            "  CREATE SECRET (TYPE datadog, API_KEY '<dd-api-key>', APP_KEY "
+			                            "'<dd-app-key>', SITE 'datadoghq.com');");
 		}
 	}
 

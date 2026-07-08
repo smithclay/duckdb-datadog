@@ -60,18 +60,29 @@ static constexpr idx_t COL_LOG_ATTRS = 15;
 static constexpr idx_t COLUMN_COUNT = 18;
 
 static void GetLogsSchema(vector<LogicalType> &types, vector<string> &names) {
-	names = {"time_unix_nano",   "observed_time_unix_nano", "trace_id",
-	         "span_id",          "service_name",            "service_namespace",
-	         "service_instance_id", "severity_number",      "severity_text",
-	         "event_name",       "body",                    "resource_attributes",
-	         "scope_name",       "scope_version",           "scope_attributes",
-	         "log_attributes",   "dropped_attributes_count", "flags"};
-	types = {LogicalType::TIMESTAMP_NS, LogicalType::TIMESTAMP_NS, LogicalType::VARCHAR,
-	         LogicalType::VARCHAR,      LogicalType::VARCHAR,      LogicalType::VARCHAR,
-	         LogicalType::VARCHAR,      LogicalType::INTEGER,      LogicalType::VARCHAR,
-	         LogicalType::VARCHAR,      LogicalType::VARCHAR,      LogicalType::VARCHAR,
-	         LogicalType::VARCHAR,      LogicalType::VARCHAR,      LogicalType::VARCHAR,
-	         LogicalType::VARCHAR,      LogicalType::INTEGER,      LogicalType::INTEGER};
+	names = {"time_unix_nano",
+	         "observed_time_unix_nano",
+	         "trace_id",
+	         "span_id",
+	         "service_name",
+	         "service_namespace",
+	         "service_instance_id",
+	         "severity_number",
+	         "severity_text",
+	         "event_name",
+	         "body",
+	         "resource_attributes",
+	         "scope_name",
+	         "scope_version",
+	         "scope_attributes",
+	         "log_attributes",
+	         "dropped_attributes_count",
+	         "flags"};
+	types = {LogicalType::TIMESTAMP_NS, LogicalType::TIMESTAMP_NS, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	         LogicalType::VARCHAR,      LogicalType::VARCHAR,      LogicalType::VARCHAR, LogicalType::INTEGER,
+	         LogicalType::VARCHAR,      LogicalType::VARCHAR,      LogicalType::VARCHAR, LogicalType::VARCHAR,
+	         LogicalType::VARCHAR,      LogicalType::VARCHAR,      LogicalType::VARCHAR, LogicalType::VARCHAR,
+	         LogicalType::INTEGER,      LogicalType::INTEGER};
 	D_ASSERT(names.size() == COLUMN_COUNT && types.size() == COLUMN_COUNT);
 }
 

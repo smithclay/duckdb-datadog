@@ -1,0 +1,117 @@
+name: Pages
+#
+# Publishes the built extension binaries as an unsigned DuckDB extension repository on GitHub Pages.
+# Enable Pages with source "GitHub Actions" once (Settings -> Pages); this workflow is the only
+# deployer. Each run rebuilds every supported platform and uploads one Pages snapshot laid out as
+# <duckdb_version>/<platform>/datadog.duckdb_extension(.gz|.wasm) — the exact tree DuckDB's
+# `INSTALL ... FROM '<pages-url>'` expects.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  EXT_NAME: datadog
+  DUCKDB_VERSION: v1.5.4
+
+jobs:
+  build:
+    name: Build extension binaries
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    with:
+      duckdb_version: v1.5.4
+      ci_tools_version: v1.5-variegata
+      extension_name: datadog
+
+  deploy:
+    name: Package and deploy to Pages
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: ${{ env.EXT_NAME }}-${{ env.DUCKDB_VERSION }}-extension-*
+
+      - name: Assemble extension repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          prefix="${EXT_NAME}-${DUCKDB_VERSION}-extension-"
+          found=0
+          mkdir -p _site
+          for dir in artifacts/${prefix}*/; do
+            arch="$(basename "$dir")"
+            arch="${arch#"${prefix}"}"
+            out="_site/${DUCKDB_VERSION}/${arch}"
+            mkdir -p "$out"
+
+            # WASM binaries load over plain HTTP as <name>.duckdb_extension.wasm and must stay
+            # uncompressed: GitHub Pages cannot set the `Content-Encoding: br` header the canonical
+            # repository uses, so the browser has to receive raw wasm.
+            if [[ "$arch" == wasm* ]]; then
+              src="${dir}${EXT_NAME}.duckdb_extension.wasm"
+              [ -f "$src" ] || { echo "::error::missing ${src}"; exit 1; }
+              cp "$src" "${out}/${EXT_NAME}.duckdb_extension.wasm"
+              echo "packaged ${arch} (wasm)"
+            else
+              src="${dir}${EXT_NAME}.duckdb_extension"
+              [ -f "$src" ] || { echo "::error::missing ${src}"; exit 1; }
+              # Native platforms are served gzipped at <version>/<arch>/<name>.duckdb_extension.gz.
+              # The binaries already end in the unsigned 256-byte zero signature; re-normalize it so
+              # packaging stays correct even if a future build emits a different placeholder.
+              cp "$src" work.bin
+              truncate -s -256 work.bin
+              dd if=/dev/zero bs=256 count=1 status=none >> work.bin
+              gzip -n < work.bin > "${out}/${EXT_NAME}.duckdb_extension.gz"
+              rm -f work.bin
+              echo "packaged ${arch}"
+            fi
+            found=$((found + 1))
+          done
+          [ "$found" -gt 0 ] || { echo "::error::no extension binaries found to package"; exit 1; }
+
+          # Human-facing landing page. .nojekyll keeps Pages from dropping the versioned tree.
+          owner="${GITHUB_REPOSITORY%%/*}"
+          repo="${GITHUB_REPOSITORY#*/}"
+          pages_url="https://${owner}.github.io/${repo}"
+          touch _site/.nojekyll
+          {
+            echo "<!doctype html><meta charset=utf-8>"
+            echo "<title>duckdb-${EXT_NAME} extension repository</title>"
+            echo "<h1>duckdb-${EXT_NAME} extension repository</h1>"
+            echo "<p>Unsigned DuckDB extension repository. Requires DuckDB <code>${DUCKDB_VERSION}</code>.</p>"
+            echo "<pre>SET allow_unsigned_extensions = true;"
+            echo "INSTALL ${EXT_NAME} FROM '${pages_url}';"
+            echo "LOAD ${EXT_NAME};</pre>"
+            echo "<h2>Available binaries</h2><ul>"
+            for f in $(cd _site && find "${DUCKDB_VERSION}" \( -name '*.duckdb_extension.gz' -o -name '*.duckdb_extension.wasm' \) | sort); do
+              echo "<li><a href=\"${f}\">${f}</a></li>"
+            done
+            echo "</ul>"
+          } > _site/index.html
+          echo "Packaged ${found} platform(s) for ${DUCKDB_VERSION}"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

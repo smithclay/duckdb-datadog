@@ -21,6 +21,9 @@ struct DatadogClient {
 	string app_key;
 	//! Per-request connection/read timeout.
 	uint64_t timeout_seconds = 60;
+	//! On HTTP 429 (rate limited), retry the request up to this many times, waiting the server-advised
+	//! delay (Datadog's X-RateLimit-Reset, or Retry-After) between attempts. 0 disables retrying.
+	uint64_t rate_limit_retries = 4;
 
 	// Owns a live keep-alive connection (the unique_ptr below), so the type is non-copyable. It is
 	// only ever default-constructed in place inside the table function's bind data — never copied
@@ -31,8 +34,9 @@ struct DatadogClient {
 	~DatadogClient();
 
 	//! POST `request_body_json` to /api/v2/logs/events/search and return the raw response body.
-	//! Throws IOException on transport failure or a non-2xx status. Successive calls reuse the same
-	//! HTTP connection.
+	//! Transparently retries HTTP 429 responses (honoring the server's reset delay) up to
+	//! `rate_limit_retries` times. Throws IOException on transport failure or a non-2xx status that
+	//! is not a retryable 429. Successive calls reuse the same HTTP connection.
 	string SearchLogs(const string &request_body_json) const;
 
 private:

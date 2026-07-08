@@ -1,0 +1,102 @@
+# duckdb-datadog
+
+A DuckDB extension that reads logs from the [Datadog Logs Search API v2](https://docs.datadoghq.com/api/latest/logs/)
+directly into DuckDB tables. Rows conform to the
+[duckdb-otlp](https://github.com/smithclay/otlp2records) `read_otlp_logs` schema, so Datadog logs
+drop straight into an OTLP-shaped lakehouse alongside data from other sources.
+
+Logs are supported today; traces/spans and metrics are planned.
+
+## Quick start
+
+```sql
+LOAD datadog;
+
+-- Store your Datadog credentials once (kept out of query text; redacted in duckdb_secrets()).
+CREATE SECRET (
+    TYPE datadog,
+    API_KEY '<dd-api-key>',
+    APP_KEY '<dd-application-key>',
+    SITE 'datadoghq.com'          -- optional; e.g. datadoghq.eu, us5.datadoghq.com
+);
+
+-- Read a window of logs into a table.
+CREATE TABLE logs AS
+SELECT * FROM read_datadog_logs(
+    query  => 'service:web-store status:error',
+    "from" => 'now-1h',           -- relative (now-1h) or absolute (epoch ms / ISO-8601)
+    "to"   => 'now'
+);
+```
+
+`API_KEY` needs the `logs_read_data` permission. `from`/`to` accept anything the Datadog API
+accepts: relative like `now-1h`, epoch milliseconds, or ISO-8601.
+
+### `read_datadog_logs` parameters
+
+| Parameter  | Type    | Default    | Description |
+|------------|---------|------------|-------------|
+| `query`    | VARCHAR | `*`        | Datadog log search query. |
+| `from`     | VARCHAR | `now-15m`  | Start of the time window. |
+| `to`       | VARCHAR | `now`      | End of the time window. |
+| `limit`    | BIGINT  | `1000`     | Page size (Datadog max is 1000). |
+| `max_rows` | BIGINT  | unlimited  | Safety cap on total rows returned. |
+| `secret`   | VARCHAR | first `datadog` secret | Name of a specific secret to use. |
+
+The function pages through the whole window for you by following Datadog's cursor
+(`meta.page.after`), sorted ascending by timestamp. Results stream page-by-page and are never
+fully buffered in memory. For a window so large it exceeds Datadog's cursor depth, page through it
+by calling the function once per narrower sub-range (e.g. an hour at a time).
+
+### Output schema
+
+Matches duckdb-otlp `read_otlp_logs`:
+
+`time_unix_nano`, `observed_time_unix_nano` (TIMESTAMP_NS); `trace_id`, `span_id` (VARCHAR hex);
+`service_name`, `service_namespace`, `service_instance_id` (VARCHAR); `severity_number` (INTEGER),
+`severity_text` (VARCHAR); `event_name`, `body` (VARCHAR); `resource_attributes` (VARCHAR JSON —
+host/tags); `scope_name`, `scope_version`, `scope_attributes` (VARCHAR); `log_attributes` (VARCHAR
+JSON — Datadog custom attributes); `dropped_attributes_count`, `flags` (INTEGER).
+
+Because attribute columns are JSON strings, query them with DuckDB's JSON functions, e.g.
+`SELECT log_attributes->>'$.http.status_code' FROM logs`.
+
+## Building
+
+Dependencies are minimal: only OpenSSL (via vcpkg). HTTP (cpp-httplib) and JSON (yyjson) reuse the
+copies DuckDB already bundles, so nothing extra is pulled in.
+
+```shell
+# vcpkg provides OpenSSL
+git clone https://github.com/Microsoft/vcpkg.git
+./vcpkg/bootstrap-vcpkg.sh
+export VCPKG_TOOLCHAIN_PATH=`pwd`/vcpkg/scripts/buildsystems/vcpkg.cmake
+
+make            # builds ./build/release/duckdb and the loadable extension
+make test       # runs the offline SQL tests in test/sql/
+```
+
+Built artifacts:
+- `./build/release/duckdb` — DuckDB shell with the extension preloaded.
+- `./build/release/extension/datadog/datadog.duckdb_extension` — the loadable binary.
+
+## Testing
+
+`make test` runs `test/sql/datadog.test`, which covers extension loading, the `datadog` secret
+type (including credential redaction), function registration, and the output schema. These tests
+are fully offline (no network).
+
+### End-to-end test
+
+`test/e2e/run_e2e.sh` exercises the full round-trip against a real Datadog account: it sends a
+uniquely-tagged log via the log intake API, then reads it back through `read_datadog_logs` and
+asserts the mapping. It shares credentials with the [`pup` CLI](https://docs.datadoghq.com/cli/)
+(`DD_API_KEY` / `DD_APP_KEY` / `DD_SITE`) and, when `pup` is installed, uses it for an auth-status
+check and an independent cross-check of the ingested log.
+
+```shell
+make release                                   # build the duckdb binary + extension first
+DD_API_KEY=... DD_APP_KEY=... test/e2e/run_e2e.sh
+```
+
+Because Datadog ingestion has indexing latency, the script polls for up to ~150s.

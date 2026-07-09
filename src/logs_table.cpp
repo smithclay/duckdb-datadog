@@ -216,57 +216,90 @@ static string BuildSearchBody(const string &query, const string &from, const str
 	return json ? string(json.get()) : string();
 }
 
-//! Map one Datadog log event (`data[]` element) to a row of Values in output-schema order.
-static void MapEvent(yyjson_val *item, vector<Value> &row) {
-	row.assign(COLUMN_COUNT, Value()); // all columns NULL by default
+//! Map one Datadog log event (`data[]` element) to the projected columns of a row.
+//! `column_ids[c]` is the source column for output slot c (projection pushdown); only projected
+//! columns are computed, so deselected fields — above all the log_attributes JSON serialization,
+//! the dominant per-row cost — are skipped entirely for aggregate/triage queries.
+static void MapEvent(yyjson_val *item, const vector<column_t> &column_ids, vector<Value> &row) {
+	row.assign(column_ids.size(), Value()); // all projected columns NULL by default
 
 	yyjson_val *attributes = yyjson_obj_get(item, "attributes");
 	yyjson_val *custom = attributes ? yyjson_obj_get(attributes, "attributes") : nullptr;
 
-	const char *timestamp = GetStr(attributes, "timestamp");
-	if (timestamp) {
-		int64_t nanos;
-		if (ParseIso8601ToNanos(timestamp, nanos)) {
-			row[COL_TIME] = Value::TIMESTAMPNS(timestamp_ns_t(nanos));
-			row[COL_OBSERVED_TIME] = Value::TIMESTAMPNS(timestamp_ns_t(nanos));
+	for (idx_t c = 0; c < column_ids.size(); c++) {
+		switch (column_ids[c]) {
+		case COL_TIME:
+		case COL_OBSERVED_TIME: {
+			const char *timestamp = GetStr(attributes, "timestamp");
+			int64_t nanos;
+			if (timestamp && ParseIso8601ToNanos(timestamp, nanos)) {
+				row[c] = Value::TIMESTAMPNS(timestamp_ns_t(nanos));
+			}
+			break;
 		}
-	}
-
-	// Trace correlation is only present when the log carries it in custom attributes.
-	const char *trace_id = GetStr(custom, "trace_id");
-	const char *span_id = GetStr(custom, "span_id");
-	if (trace_id) {
-		row[COL_TRACE_ID] = Value(string(trace_id));
-	}
-	if (span_id) {
-		row[COL_SPAN_ID] = Value(string(span_id));
-	}
-
-	const char *service = GetStr(attributes, "service");
-	if (service) {
-		row[COL_SERVICE_NAME] = Value(string(service));
-	}
-
-	const char *status = GetStr(attributes, "status");
-	if (status) {
-		row[COL_SEVERITY_TEXT] = Value(string(status));
-		row[COL_SEVERITY_NUMBER] = Value::INTEGER(StatusToSeverityNumber(status));
-	}
-
-	const char *message = GetStr(attributes, "message");
-	if (message) {
-		row[COL_BODY] = Value(string(message));
-	}
-
-	string resource_attributes = BuildResourceAttributes(attributes);
-	if (!resource_attributes.empty()) {
-		row[COL_RESOURCE_ATTRS] = Value(resource_attributes);
-	}
-
-	if (custom && yyjson_is_obj(custom)) {
-		string log_attributes = SerializeVal(custom);
-		if (!log_attributes.empty()) {
-			row[COL_LOG_ATTRS] = Value(log_attributes);
+		// Trace correlation is only present when the log carries it in custom attributes.
+		case COL_TRACE_ID: {
+			const char *trace_id = GetStr(custom, "trace_id");
+			if (trace_id) {
+				row[c] = Value(string(trace_id));
+			}
+			break;
+		}
+		case COL_SPAN_ID: {
+			const char *span_id = GetStr(custom, "span_id");
+			if (span_id) {
+				row[c] = Value(string(span_id));
+			}
+			break;
+		}
+		case COL_SERVICE_NAME: {
+			const char *service = GetStr(attributes, "service");
+			if (service) {
+				row[c] = Value(string(service));
+			}
+			break;
+		}
+		case COL_SEVERITY_NUMBER: {
+			const char *status = GetStr(attributes, "status");
+			if (status) {
+				row[c] = Value::INTEGER(StatusToSeverityNumber(status));
+			}
+			break;
+		}
+		case COL_SEVERITY_TEXT: {
+			const char *status = GetStr(attributes, "status");
+			if (status) {
+				row[c] = Value(string(status));
+			}
+			break;
+		}
+		case COL_BODY: {
+			const char *message = GetStr(attributes, "message");
+			if (message) {
+				row[c] = Value(string(message));
+			}
+			break;
+		}
+		case COL_RESOURCE_ATTRS: {
+			string resource_attributes = BuildResourceAttributes(attributes);
+			if (!resource_attributes.empty()) {
+				row[c] = Value(resource_attributes);
+			}
+			break;
+		}
+		case COL_LOG_ATTRS: {
+			if (custom && yyjson_is_obj(custom)) {
+				string log_attributes = SerializeVal(custom);
+				if (!log_attributes.empty()) {
+					row[c] = Value(log_attributes);
+				}
+			}
+			break;
+		}
+		default:
+			// Columns Datadog has no data for (scope_*, event_name, ...) and virtual columns
+			// (e.g. the rowid sentinel a bare count(*) projects) stay NULL.
+			break;
 		}
 	}
 }
@@ -279,13 +312,16 @@ struct DatadogLogsBindData : public TableFunctionData {
 	string query = "*";
 	string from = "now-15m";
 	string to = "now";
-	int64_t page_limit = 1000; // Datadog max
-	int64_t max_rows = 0;      // 0 = unlimited
+	int64_t page_size = 1000; // rows per API request (Datadog max)
+	int64_t max_rows = 0;     // 0 = unlimited
 	DatadogClient client;
 };
 
 struct DatadogLogsGlobalState : public GlobalTableFunctionState {
-	//! Rows parsed and waiting to be emitted.
+	//! Source column for each output slot (projection pushdown); may contain virtual-column
+	//! sentinels (e.g. rowid for a bare count(*)), which MapEvent leaves NULL.
+	vector<column_t> column_ids;
+	//! Rows (projected columns only) parsed and waiting to be emitted.
 	std::deque<vector<Value>> buffer;
 	//! Next-page cursor from meta.page.after ("" = request the first page).
 	string cursor;
@@ -304,9 +340,9 @@ struct DatadogLogsGlobalState : public GlobalTableFunctionState {
 //! Datadog cursor pagination retrieves the full [from, to] window. Windows so large that they
 //! exceed the API's cursor depth should be paged through by narrowing `from`/`to` at the call
 //! site (e.g. one hour at a time).
-static void FetchNextPage(const DatadogLogsBindData &bind, DatadogLogsGlobalState &state) {
-	string body = BuildSearchBody(bind.query, bind.from, bind.to, bind.page_limit, state.cursor);
-	string response = bind.client.SearchLogs(body);
+static void FetchNextPage(ClientContext &context, const DatadogLogsBindData &bind, DatadogLogsGlobalState &state) {
+	string body = BuildSearchBody(bind.query, bind.from, bind.to, bind.page_size, state.cursor);
+	string response = bind.client.SearchLogs(context, body);
 
 	YyjsonDocPtr doc(yyjson_read(response.c_str(), response.size(), 0));
 	if (!doc) {
@@ -321,7 +357,7 @@ static void FetchNextPage(const DatadogLogsBindData &bind, DatadogLogsGlobalStat
 		yyjson_val *item;
 		yyjson_arr_foreach(data, idx, max, item) {
 			vector<Value> row;
-			MapEvent(item, row);
+			MapEvent(item, state.column_ids, row);
 			state.buffer.push_back(std::move(row));
 			page_rows++;
 		}
@@ -354,20 +390,29 @@ static unique_ptr<FunctionData> DatadogLogsBind(ClientContext &context, TableFun
 			result->from = param.second.ToString();
 		} else if (key == "to") {
 			result->to = param.second.ToString();
-		} else if (key == "limit") {
-			result->page_limit = param.second.GetValue<int64_t>();
+		} else if (key == "page_size") {
+			result->page_size = param.second.GetValue<int64_t>();
 		} else if (key == "max_rows") {
 			result->max_rows = param.second.GetValue<int64_t>();
+		} else if (key == "retries") {
+			auto retries = param.second.GetValue<int64_t>();
+			if (retries < 0) {
+				throw InvalidInputException("read_datadog_logs: retries must be >= 0 (0 disables retrying)");
+			}
+			result->client.retries = static_cast<uint64_t>(retries);
+		} else if (key == "timeout") {
+			auto timeout = param.second.GetValue<int64_t>();
+			if (timeout < 1) {
+				throw InvalidInputException("read_datadog_logs: timeout must be >= 1 (seconds)");
+			}
+			result->client.timeout_seconds = static_cast<uint64_t>(timeout);
 		} else if (key == "secret") {
 			secret_name = param.second.ToString();
 		}
 	}
 
-	if (result->page_limit < 1) {
-		result->page_limit = 1;
-	}
-	if (result->page_limit > 1000) {
-		result->page_limit = 1000; // Datadog hard limit
+	if (result->page_size < 1 || result->page_size > 1000) {
+		throw InvalidInputException("read_datadog_logs: page_size must be between 1 and 1000 (the Datadog API limit)");
 	}
 	if (result->max_rows < 0) {
 		throw InvalidInputException("read_datadog_logs: max_rows must be >= 0 (0 means unlimited)");
@@ -384,7 +429,9 @@ static unique_ptr<FunctionData> DatadogLogsBind(ClientContext &context, TableFun
 
 static unique_ptr<GlobalTableFunctionState> DatadogLogsInitGlobal(ClientContext &context,
                                                                   TableFunctionInitInput &input) {
-	return make_uniq<DatadogLogsGlobalState>();
+	auto state = make_uniq<DatadogLogsGlobalState>();
+	state->column_ids = input.column_ids;
+	return std::move(state);
 }
 
 static void DatadogLogsScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
@@ -399,7 +446,7 @@ static void DatadogLogsScan(ClientContext &context, TableFunctionInput &data_p, 
 
 	// Refill the buffer, fetching as many pages as needed to get at least one row (or finish).
 	while (state.buffer.empty() && !state.finished) {
-		FetchNextPage(bind, state);
+		FetchNextPage(context, bind, state);
 	}
 
 	idx_t count = 0;
@@ -410,7 +457,7 @@ static void DatadogLogsScan(ClientContext &context, TableFunctionInput &data_p, 
 			break;
 		}
 		auto &row = state.buffer.front();
-		for (idx_t col = 0; col < COLUMN_COUNT; col++) {
+		for (idx_t col = 0; col < row.size(); col++) {
 			output.SetValue(col, count, row[col]);
 		}
 		state.buffer.pop_front();
@@ -426,9 +473,15 @@ void RegisterDatadogLogsFunction(ExtensionLoader &loader) {
 	function.named_parameters["query"] = LogicalType::VARCHAR;
 	function.named_parameters["from"] = LogicalType::VARCHAR;
 	function.named_parameters["to"] = LogicalType::VARCHAR;
-	function.named_parameters["limit"] = LogicalType::BIGINT;
+	function.named_parameters["page_size"] = LogicalType::BIGINT;
 	function.named_parameters["max_rows"] = LogicalType::BIGINT;
+	function.named_parameters["retries"] = LogicalType::BIGINT;
+	function.named_parameters["timeout"] = LogicalType::BIGINT;
 	function.named_parameters["secret"] = LogicalType::VARCHAR;
+	// Only projected columns are mapped from the API response; the network cost is unchanged
+	// (the search API has no response field selection), but e.g. a count(*) or a GROUP BY
+	// service_name never pays the per-row log_attributes JSON serialization.
+	function.projection_pushdown = true;
 	loader.RegisterFunction(function);
 }
 

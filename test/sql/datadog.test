@@ -57,3 +57,35 @@ WHERE column_name IN ('time_unix_nano', 'observed_time_unix_nano', 'trace_id', '
                       'severity_text', 'body', 'resource_attributes', 'log_attributes', 'flags');
 ----
 10
+
+# Named parameters are validated at bind time (no network call is needed to hit these errors).
+statement error
+SELECT * FROM read_datadog_logs(page_size => 0);
+----
+page_size must be between 1 and 1000
+
+statement error
+SELECT * FROM read_datadog_logs(page_size => 1001);
+----
+page_size must be between 1 and 1000
+
+statement error
+SELECT * FROM read_datadog_logs(max_rows => -1);
+----
+max_rows must be >= 0
+
+statement error
+SELECT * FROM read_datadog_logs(retries => -1);
+----
+retries must be >= 0
+
+statement error
+SELECT * FROM read_datadog_logs(timeout => 0);
+----
+timeout must be >= 1
+
+# The old page-size parameter name is gone (renamed to page_size before any release).
+statement error
+SELECT * FROM read_datadog_logs("limit" => 10);
+----
+Invalid named parameter

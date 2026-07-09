@@ -34,19 +34,33 @@ accepts: relative like `now-1h`, epoch milliseconds, or ISO-8601.
 
 ### `read_datadog_logs` parameters
 
-| Parameter  | Type    | Default    | Description |
-|------------|---------|------------|-------------|
-| `query`    | VARCHAR | `*`        | Datadog log search query. |
-| `from`     | VARCHAR | `now-15m`  | Start of the time window. |
-| `to`       | VARCHAR | `now`      | End of the time window. |
-| `limit`    | BIGINT  | `1000`     | Page size (Datadog max is 1000). |
-| `max_rows` | BIGINT  | unlimited  | Safety cap on total rows returned. |
-| `secret`   | VARCHAR | first `datadog` secret | Name of a specific secret to use. |
+| Parameter   | Type    | Default    | Description |
+|-------------|---------|------------|-------------|
+| `query`     | VARCHAR | `*`        | Datadog log search query. |
+| `from`      | VARCHAR | `now-15m`  | Start of the time window. |
+| `to`        | VARCHAR | `now`      | End of the time window. |
+| `page_size` | BIGINT  | `1000`     | Rows fetched per API request (1–1000, the Datadog max). |
+| `max_rows`  | BIGINT  | unlimited  | Safety cap on total rows returned. |
+| `retries`   | BIGINT  | `4`        | Retry budget for transient failures (HTTP 429/5xx, network errors); 0 disables retrying. |
+| `timeout`   | BIGINT  | `60`       | Per-request connection/read timeout, in seconds. |
+| `secret`    | VARCHAR | first `datadog` secret | Name of a specific secret to use. |
 
 The function pages through the whole window for you by following Datadog's cursor
 (`meta.page.after`), sorted ascending by timestamp. Results stream page-by-page and are never
 fully buffered in memory. For a window so large it exceeds Datadog's cursor depth, page through it
 by calling the function once per narrower sub-range (e.g. an hour at a time).
+
+Transient failures are retried automatically: HTTP 429 waits out the server-advised rate-limit
+reset (`X-RateLimit-Reset` / `Retry-After`), and HTTP 5xx or dropped connections retry with
+exponential backoff — so a long paginated scan rides out blips instead of losing its cursor.
+Retry waits honor query cancellation, so interrupting a query takes effect within ~100ms. Only
+the columns a query actually selects are decoded from the API response (projection pushdown):
+network cost is unchanged, but queries that skip `log_attributes` — counts, `GROUP BY
+service_name`, severity triage — avoid most per-row CPU and buffering.
+
+Throughput is bounded by Datadog's search API rate limit, which on some sites is as low as
+2 requests / 10s (≈ 12k rows/minute at the default page size). That is fine for investigation
+windows and error triage; for bulk export of entire indexes, use Datadog log archives instead.
 
 ### Output schema
 

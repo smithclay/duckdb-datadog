@@ -2,6 +2,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/main/client_context.hpp"
 
 #include <chrono>
 #include <thread>
@@ -59,6 +60,31 @@ duckdb_httplib_openssl::Client &DatadogClient::GetConnection() const {
 	return *connection;
 }
 
+//! Sleep for `seconds`, polling the query's interrupt flag so a cancelled query (Ctrl+C) aborts
+//! the wait within ~100ms instead of blocking a scan thread for the full retry delay.
+static void SleepCheckingInterrupt(ClientContext &context, uint64_t seconds) {
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+	while (std::chrono::steady_clock::now() < deadline) {
+		if (context.interrupted) {
+			throw InterruptException();
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	}
+}
+
+//! TLS certificate/hostname failures are configuration or security problems — retrying cannot
+//! succeed and would only delay (or worse, mask) the real error.
+static bool IsRetryableTransportError(duckdb_httplib_openssl::Error error) {
+	switch (error) {
+	case duckdb_httplib_openssl::Error::SSLLoadingCerts:
+	case duckdb_httplib_openssl::Error::SSLServerVerification:
+	case duckdb_httplib_openssl::Error::SSLServerHostnameVerification:
+		return false;
+	default:
+		return true;
+	}
+}
+
 //! Seconds to wait before retrying a 429, based on the server's advice. Datadog sends
 //! X-RateLimit-Reset (seconds until the limit resets); Retry-After is the conventional fallback.
 //! If neither is present or parseable, fall back to exponential backoff. The result is clamped to
@@ -82,13 +108,10 @@ static uint64_t RateLimitRetryDelaySeconds(const duckdb_httplib_openssl::Respons
 			// Unparseable header (e.g. an HTTP-date Retry-After); fall back to backoff below.
 		}
 	}
-	uint64_t backoff = 1ull << attempt; // 1, 2, 4, 8, ... seconds
-	return backoff > 60 ? 60 : backoff;
+	return MinValue<uint64_t>(uint64_t(1) << attempt, 60); // 1, 2, 4, 8, ... seconds
 }
 
-string DatadogClient::SearchLogs(const string &request_body_json) const {
-	auto &client = GetConnection();
-
+string DatadogClient::SearchLogs(ClientContext &context, const string &request_body_json) const {
 	duckdb_httplib_openssl::Headers headers = {
 	    {"DD-API-KEY", api_key},
 	    {"DD-APPLICATION-KEY", app_key},
@@ -96,16 +119,35 @@ string DatadogClient::SearchLogs(const string &request_body_json) const {
 	};
 
 	for (uint64_t attempt = 0;; attempt++) {
-		auto response = client.Post("/api/v2/logs/events/search", headers, request_body_json, "application/json");
-		if (!response) {
-			throw IOException("Datadog API request to %s failed: %s", BuildBaseUrl(site),
-			                  duckdb_httplib_openssl::to_string(response.error()));
+		if (context.interrupted) {
+			throw InterruptException();
 		}
-		// Datadog rate-limits the search API (e.g. 2 requests / 10s on some sites). Wait out the
-		// server-advised reset and retry rather than failing the whole query on a transient 429.
-		if (response->status == 429 && attempt < rate_limit_retries) {
-			uint64_t delay = RateLimitRetryDelaySeconds(*response, attempt);
-			std::this_thread::sleep_for(std::chrono::seconds(delay));
+		auto response =
+		    GetConnection().Post("/api/v2/logs/events/search", headers, request_body_json, "application/json");
+
+		if (!response) {
+			auto error = response.error();
+			// Drop the pooled connection: after a transport error the socket may be half-dead, and
+			// reconnecting from scratch is the reliable way to retry.
+			connection.reset();
+			if (attempt >= retries || !IsRetryableTransportError(error)) {
+				throw IOException("Datadog API request to %s failed: %s", BuildBaseUrl(site),
+				                  duckdb_httplib_openssl::to_string(error));
+			}
+			SleepCheckingInterrupt(context, MinValue<uint64_t>(uint64_t(1) << attempt, 60));
+			continue;
+		}
+
+		// Rate limited: wait out the server-advised reset (Datadog limits the search API, e.g.
+		// 2 requests / 10s on some sites) instead of failing the whole query on a transient 429.
+		if (response->status == 429 && attempt < retries) {
+			SleepCheckingInterrupt(context, RateLimitRetryDelaySeconds(*response, attempt));
+			continue;
+		}
+		// Server-side errors are usually transient; a long paginated scan should ride them out
+		// rather than lose the cursor (there is no way to resume a scan mid-pagination).
+		if (response->status >= 500 && attempt < retries) {
+			SleepCheckingInterrupt(context, MinValue<uint64_t>(uint64_t(1) << attempt, 60));
 			continue;
 		}
 		if (response->status < 200 || response->status >= 300) {

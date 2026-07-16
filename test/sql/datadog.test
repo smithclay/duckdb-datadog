@@ -133,6 +133,19 @@ SELECT count(*) FROM (DESCRIBE SELECT * FROM dd.logs.main);
 ----
 18
 
+# Supported WHERE predicates bind through the catalog without executing a network request.
+# They are translated conservatively and remain as DuckDB residual filters.
+statement ok
+EXPLAIN SELECT body FROM dd.logs.main
+WHERE service_name = 'edge'
+  AND severity_text = 'error'
+  AND time_unix_nano >= TIMESTAMP_NS '2026-01-01 00:00:00';
+
+# Unsupported shapes remain ordinary local DuckDB filters.
+statement ok
+EXPLAIN SELECT body FROM dd.logs.main
+WHERE body LIKE '%timeout%' OR severity_number >= 17;
+
 query I
 SELECT count(*)
 FROM (

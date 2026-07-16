@@ -5,6 +5,7 @@
 #include "yyjson.hpp"
 
 #include <cstdlib>
+#include <algorithm>
 #include <memory>
 #include <unordered_set>
 
@@ -73,6 +74,49 @@ vector<string> ParseDatadogLogIndexes(const string &response_json) {
 			result.push_back(std::move(name));
 		}
 	}
+	return result;
+}
+
+string BuildDatadogSearchQuery(const string &query, const vector<string> &query_terms) {
+	if (query_terms.empty()) {
+		return query;
+	}
+
+	string pushed_query;
+	for (idx_t i = 0; i < query_terms.size(); i++) {
+		if (i > 0) {
+			pushed_query += " AND ";
+		}
+		pushed_query += query_terms[i];
+	}
+	if (query == "*") {
+		return pushed_query;
+	}
+	return "(" + query + ") AND " + pushed_query;
+}
+
+DatadogResolvedSearch ResolveDatadogSearch(const string &query, const string &from, const string &to,
+                                           const DatadogFilterPushdown &pushdown, int64_t now_ms) {
+	DatadogResolvedSearch result;
+	result.query = BuildDatadogSearchQuery(query, pushdown.query_terms);
+	result.from = from;
+	result.to = to;
+	if ((!pushdown.has_lower_bound_ms && !pushdown.has_upper_bound_ms) || from != "now-15m" || to != "now") {
+		return result;
+	}
+
+	constexpr int64_t DEFAULT_WINDOW_MS = 15 * 60 * 1000;
+	int64_t lower_bound_ms = now_ms - DEFAULT_WINDOW_MS;
+	int64_t upper_bound_ms = now_ms;
+	if (pushdown.has_lower_bound_ms) {
+		lower_bound_ms = std::max(lower_bound_ms, pushdown.lower_bound_ms);
+	}
+	if (pushdown.has_upper_bound_ms) {
+		upper_bound_ms = std::min(upper_bound_ms, pushdown.upper_bound_ms);
+	}
+	result.from = std::to_string(lower_bound_ms);
+	result.to = std::to_string(upper_bound_ms);
+	result.empty = lower_bound_ms > upper_bound_ms;
 	return result;
 }
 

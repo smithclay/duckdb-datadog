@@ -82,6 +82,23 @@ current defaults: query `*`, from `now-15m` to `now`. The catalog is read-only. 
 `read_datadog_logs` when you need a custom query, time window, page size, row cap, retry budget, or
 timeout.
 
+A small, conservative subset of SQL predicates is pushed into Datadog while the original `WHERE`
+clause is still evaluated by DuckDB for exact SQL semantics:
+
+```sql
+SELECT time_unix_nano, service_name, severity_text, body
+FROM dd.logs.main
+WHERE service_name = 'edge'
+  AND severity_text = 'error'
+  AND time_unix_nano >= TIMESTAMP '2026-07-16 03:00:00';
+```
+
+Literal equality on `service_name` and `severity_text` becomes Datadog `service:` and `status:`
+search terms. Literal `>`, `>=`, `<`, and `<=` bounds on `time_unix_nano` narrow the default
+15-minute request window. `AND` combinations are supported. Other predicates—including `OR`,
+`NOT`, `IN`, `LIKE`, regular expressions, JSON expressions, and non-literal comparisons—remain
+local DuckDB filters.
+
 ### `read_datadog_logs` parameters
 
 | Parameter   | Type    | Default    | Description |

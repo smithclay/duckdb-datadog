@@ -10,10 +10,16 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 
 #include "yyjson.hpp"
 
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -290,6 +296,7 @@ struct DatadogLogsBindData : public TableFunctionData {
 	int64_t page_size = 1000; // rows per API request (Datadog max)
 	int64_t max_rows = 0;     // 0 = unlimited
 	vector<string> indexes;   // empty = search all indexes (existing table-function behavior)
+	DatadogFilterPushdown pushdown;
 	TableCatalogEntry *table = nullptr;
 	DatadogClient client;
 };
@@ -302,6 +309,10 @@ struct DatadogLogsGlobalState : public GlobalTableFunctionState {
 	std::deque<vector<Value>> buffer;
 	//! Next-page cursor from meta.page.after ("" = request the first page).
 	string cursor;
+	//! Effective request values after conservative WHERE pushdown is resolved.
+	string request_query;
+	string request_from;
+	string request_to;
 	idx_t total_emitted = 0;
 	bool finished = false;
 
@@ -318,8 +329,8 @@ struct DatadogLogsGlobalState : public GlobalTableFunctionState {
 //! exceed the API's cursor depth should be paged through by narrowing `from`/`to` at the call
 //! site (e.g. one hour at a time).
 static void FetchNextPage(ClientContext &context, const DatadogLogsBindData &bind, DatadogLogsGlobalState &state) {
-	string body =
-	    BuildDatadogLogsSearchBody(bind.query, bind.from, bind.to, bind.page_size, state.cursor, bind.indexes);
+	string body = BuildDatadogLogsSearchBody(state.request_query, state.request_from, state.request_to, bind.page_size,
+	                                         state.cursor, bind.indexes);
 	string response = bind.client.SearchLogs(context, body);
 
 	YyjsonDocPtr doc(yyjson_read(response.c_str(), response.size(), 0));
@@ -408,7 +419,16 @@ static unique_ptr<FunctionData> DatadogLogsBind(ClientContext &context, TableFun
 static unique_ptr<GlobalTableFunctionState> DatadogLogsInitGlobal(ClientContext &context,
                                                                   TableFunctionInitInput &input) {
 	auto state = make_uniq<DatadogLogsGlobalState>();
+	auto &bind = input.bind_data->Cast<DatadogLogsBindData>();
 	state->column_ids = input.column_ids;
+	auto now_ms =
+	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+	        .count();
+	auto resolved = ResolveDatadogSearch(bind.query, bind.from, bind.to, bind.pushdown, now_ms);
+	state->request_query = std::move(resolved.query);
+	state->request_from = std::move(resolved.from);
+	state->request_to = std::move(resolved.to);
+	state->finished = resolved.empty;
 	return std::move(state);
 }
 
@@ -446,6 +466,173 @@ static void DatadogLogsScan(ClientContext &context, TableFunctionInput &data_p, 
 	output.SetCardinality(count);
 }
 
+static bool IsSafeDatadogFacetValue(const string &value) {
+	if (value.empty()) {
+		return false;
+	}
+	for (idx_t i = 0; i < value.size(); i++) {
+		auto ch = value[i];
+		auto c = static_cast<unsigned char>(ch);
+		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.' ||
+		    (c == '-' && i > 0)) {
+			continue;
+		}
+		return false;
+	}
+	return true;
+}
+
+static ExpressionType ReverseComparison(ExpressionType type) {
+	switch (type) {
+	case ExpressionType::COMPARE_LESSTHAN:
+		return ExpressionType::COMPARE_GREATERTHAN;
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		return ExpressionType::COMPARE_GREATERTHANOREQUALTO;
+	case ExpressionType::COMPARE_GREATERTHAN:
+		return ExpressionType::COMPARE_LESSTHAN;
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		return ExpressionType::COMPARE_LESSTHANOREQUALTO;
+	default:
+		return type;
+	}
+}
+
+static int64_t FloorNanosecondsToMilliseconds(int64_t nanos) {
+	constexpr int64_t NANOS_PER_MILLISECOND = 1000 * 1000;
+	auto millis = nanos / NANOS_PER_MILLISECOND;
+	if (nanos % NANOS_PER_MILLISECOND < 0) {
+		millis--;
+	}
+	return millis;
+}
+
+static int64_t CeilNanosecondsToMilliseconds(int64_t nanos) {
+	constexpr int64_t NANOS_PER_MILLISECOND = 1000 * 1000;
+	auto millis = nanos / NANOS_PER_MILLISECOND;
+	if (nanos % NANOS_PER_MILLISECOND > 0) {
+		millis++;
+	}
+	return millis;
+}
+
+static void AddDatadogQueryTerm(DatadogFilterPushdown &pushdown, string term) {
+	for (const auto &existing : pushdown.query_terms) {
+		if (existing == term) {
+			return;
+		}
+	}
+	pushdown.query_terms.push_back(std::move(term));
+}
+
+static void TryPushDatadogComparison(const LogicalGet &get, const BoundComparisonExpression &comparison,
+                                     DatadogFilterPushdown &pushdown) {
+	const BoundColumnRefExpression *column = nullptr;
+	const BoundConstantExpression *constant = nullptr;
+	auto comparison_type = comparison.type;
+
+	if (comparison.left->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+	    comparison.right->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+		column = &comparison.left->Cast<BoundColumnRefExpression>();
+		constant = &comparison.right->Cast<BoundConstantExpression>();
+	} else if (comparison.right->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+	           comparison.left->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+		column = &comparison.right->Cast<BoundColumnRefExpression>();
+		constant = &comparison.left->Cast<BoundConstantExpression>();
+		comparison_type = ReverseComparison(comparison_type);
+	} else {
+		return;
+	}
+
+	const auto &column_ids = get.GetColumnIds();
+	if (column->depth != 0 || column->binding.table_index != get.table_index ||
+	    column->binding.column_index >= column_ids.size() || constant->value.IsNull()) {
+		return;
+	}
+
+	auto source_column = column_ids[column->binding.column_index].GetPrimaryIndex();
+	if (source_column >= get.names.size()) {
+		return;
+	}
+	const auto &column_name = get.names[source_column];
+	if ((column_name == "service_name" || column_name == "severity_text") &&
+	    comparison_type == ExpressionType::COMPARE_EQUAL && constant->value.type().id() == LogicalTypeId::VARCHAR) {
+		auto value = constant->value.GetValue<string>();
+		if (!IsSafeDatadogFacetValue(value)) {
+			return;
+		}
+		AddDatadogQueryTerm(pushdown, (column_name == "service_name" ? "service:" : "status:") + value);
+		return;
+	}
+
+	if (column_name != "time_unix_nano" || constant->value.type().id() != LogicalTypeId::TIMESTAMP_NS) {
+		return;
+	}
+	auto nanos = constant->value.GetValue<timestamp_ns_t>().value;
+	switch (comparison_type) {
+	case ExpressionType::COMPARE_GREATERTHAN:
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO: {
+		auto millis = FloorNanosecondsToMilliseconds(nanos);
+		if (!pushdown.has_lower_bound_ms || millis > pushdown.lower_bound_ms) {
+			pushdown.has_lower_bound_ms = true;
+			pushdown.lower_bound_ms = millis;
+		}
+		break;
+	}
+	case ExpressionType::COMPARE_LESSTHAN:
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO: {
+		auto millis = CeilNanosecondsToMilliseconds(nanos);
+		if (!pushdown.has_upper_bound_ms || millis < pushdown.upper_bound_ms) {
+			pushdown.has_upper_bound_ms = true;
+			pushdown.upper_bound_ms = millis;
+		}
+		break;
+	}
+	default:
+		break;
+	}
+}
+
+static void TryPushDatadogExpression(const LogicalGet &get, const Expression &expression,
+                                     DatadogFilterPushdown &pushdown) {
+	if (expression.GetExpressionClass() == ExpressionClass::BOUND_COMPARISON) {
+		TryPushDatadogComparison(get, expression.Cast<BoundComparisonExpression>(), pushdown);
+		return;
+	}
+	if (expression.GetExpressionClass() != ExpressionClass::BOUND_CONJUNCTION ||
+	    expression.type != ExpressionType::CONJUNCTION_AND) {
+		return;
+	}
+	for (const auto &child : expression.Cast<BoundConjunctionExpression>().children) {
+		TryPushDatadogExpression(get, *child, pushdown);
+	}
+}
+
+static void DatadogLogsPushdownComplexFilter(ClientContext &, LogicalGet &get, FunctionData *bind_data,
+                                             vector<unique_ptr<Expression>> &filters) {
+	auto &bind = bind_data->Cast<DatadogLogsBindData>();
+	bind.pushdown = DatadogFilterPushdown();
+	for (const auto &filter : filters) {
+		TryPushDatadogExpression(get, *filter, bind.pushdown);
+	}
+	// Deliberately leave every expression in `filters`. DuckDB retains a residual
+	// filter above the scan, guaranteeing exact SQL semantics even if Datadog's
+	// search behavior or timestamp precision is broader than DuckDB's.
+}
+
+static InsertionOrderPreservingMap<string> DatadogLogsToString(TableFunctionToStringInput &input) {
+	InsertionOrderPreservingMap<string> result;
+	auto &bind = input.bind_data->Cast<DatadogLogsBindData>();
+	result["Function"] = input.table_function.name;
+	result["Datadog Query"] = BuildDatadogSearchQuery(bind.query, bind.pushdown.query_terms);
+	if (bind.pushdown.has_lower_bound_ms) {
+		result["Datadog From Bound"] = std::to_string(bind.pushdown.lower_bound_ms);
+	}
+	if (bind.pushdown.has_upper_bound_ms) {
+		result["Datadog To Bound"] = std::to_string(bind.pushdown.upper_bound_ms);
+	}
+	return result;
+}
+
 void RegisterDatadogLogsFunction(ExtensionLoader &loader) {
 	TableFunction function("read_datadog_logs", {}, DatadogLogsScan, DatadogLogsBind, DatadogLogsInitGlobal);
 	function.named_parameters["query"] = LogicalType::VARCHAR;
@@ -460,6 +647,9 @@ void RegisterDatadogLogsFunction(ExtensionLoader &loader) {
 	// (the search API has no response field selection), but e.g. a count(*) or a GROUP BY
 	// service_name never pays the per-row log_attributes JSON serialization.
 	function.projection_pushdown = true;
+	function.pushdown_complex_filter = DatadogLogsPushdownComplexFilter;
+	function.filter_pushdown = false; // translated predicates always remain as DuckDB residual filters
+	function.to_string = DatadogLogsToString;
 	loader.RegisterFunction(function);
 }
 
@@ -482,6 +672,9 @@ TableFunction GetDatadogLogsTableScan(ClientContext &context, TableCatalogEntry 
 
 	TableFunction function("datadog_logs_scan", {}, DatadogLogsScan, nullptr, DatadogLogsInitGlobal);
 	function.projection_pushdown = true;
+	function.pushdown_complex_filter = DatadogLogsPushdownComplexFilter;
+	function.filter_pushdown = false; // translated predicates always remain as DuckDB residual filters
+	function.to_string = DatadogLogsToString;
 	function.get_bind_info = DatadogLogsGetBindInfo;
 	return function;
 }

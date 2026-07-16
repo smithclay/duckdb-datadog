@@ -111,7 +111,8 @@ static uint64_t RateLimitRetryDelaySeconds(const duckdb_httplib_openssl::Respons
 	return MinValue<uint64_t>(uint64_t(1) << attempt, 60); // 1, 2, 4, 8, ... seconds
 }
 
-string DatadogClient::SearchLogs(ClientContext &context, const string &request_body_json) const {
+string DatadogClient::AuthenticatedRequest(ClientContext &context, const string &path, const string *body,
+                                           bool index_discovery) const {
 	duckdb_httplib_openssl::Headers headers = {
 	    {"DD-API-KEY", api_key},
 	    {"DD-APPLICATION-KEY", app_key},
@@ -123,7 +124,7 @@ string DatadogClient::SearchLogs(ClientContext &context, const string &request_b
 			throw InterruptException();
 		}
 		auto response =
-		    GetConnection().Post("/api/v2/logs/events/search", headers, request_body_json, "application/json");
+		    body ? GetConnection().Post(path, headers, *body, "application/json") : GetConnection().Get(path, headers);
 
 		if (!response) {
 			auto error = response.error();
@@ -151,10 +152,23 @@ string DatadogClient::SearchLogs(ClientContext &context, const string &request_b
 			continue;
 		}
 		if (response->status < 200 || response->status >= 300) {
+			if (index_discovery && (response->status == 401 || response->status == 403)) {
+				throw IOException("Datadog index discovery returned HTTP %d. Automatic discovery requires the "
+				                  "logs_read_config permission; attach with INDEXES ['main', ...] to bypass discovery",
+				                  response->status);
+			}
 			throw IOException("Datadog API returned HTTP %d: %s", response->status, response->body);
 		}
 		return response->body;
 	}
+}
+
+string DatadogClient::SearchLogs(ClientContext &context, const string &request_body_json) const {
+	return AuthenticatedRequest(context, "/api/v2/logs/events/search", &request_body_json, false);
+}
+
+string DatadogClient::ListLogIndexes(ClientContext &context) const {
+	return AuthenticatedRequest(context, "/api/v1/logs/config/indexes", nullptr, true);
 }
 
 } // namespace duckdb

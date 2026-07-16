@@ -11,9 +11,9 @@ class Client;
 namespace duckdb {
 class ClientContext;
 
-//! Minimal client for the Datadog Logs Search API v2. It knows how to authenticate and POST search
-//! requests; pagination and JSON mapping live in the table function. A single keep-alive connection
-//! is reused across calls, so paginating a query pays the TCP+TLS handshake cost only once.
+//! Minimal client for Datadog's log search and index configuration APIs. It owns shared
+//! authentication, transport, timeout, retry, and cancellation behavior; pagination and JSON
+//! mapping live outside the client. A single keep-alive connection is reused across calls.
 struct DatadogClient {
 	//! Datadog site, e.g. "datadoghq.com", "datadoghq.eu", "us5.datadoghq.com". Requests go to
 	//! https://api.<site>.
@@ -45,15 +45,24 @@ struct DatadogClient {
 	//! connection.
 	string SearchLogs(ClientContext &context, const string &request_body_json) const;
 
+	//! GET /api/v1/logs/config/indexes and return the raw response body. Authentication,
+	//! connection pooling, timeouts, retries, cancellation, and TLS behavior are shared with
+	//! SearchLogs. Permission failures include guidance about logs_read_config and INDEXES.
+	string ListLogIndexes(ClientContext &context) const;
+
 private:
 	//! Lazily created on first use and reused (HTTP keep-alive) for every later request. Mutable
-	//! because SearchLogs is const — it runs against the const bind data shared by all scans — yet
+	//! because request methods are const — scans share const bind data — yet
 	//! must cache the socket. Reset (and re-established on the next request) after a transport
 	//! error, since the failure may have left the pooled socket in a broken state.
 	mutable unique_ptr<duckdb_httplib_openssl::Client> connection;
 
 	//! Return the shared connection, creating and configuring it on the first call.
 	duckdb_httplib_openssl::Client &GetConnection() const;
+
+	//! Perform an authenticated GET or POST. A null body selects GET; otherwise POST JSON.
+	string AuthenticatedRequest(ClientContext &context, const string &path, const string *body,
+	                            bool index_discovery) const;
 };
 
 } // namespace duckdb

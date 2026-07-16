@@ -2,6 +2,7 @@
 
 #include "datadog_extension.hpp"
 
+#include "datadog_catalog.hpp"
 #include "datadog_secret.hpp"
 #include "logs_table.hpp"
 
@@ -13,6 +14,8 @@ namespace duckdb {
 static void LoadInternal(ExtensionLoader &loader) {
 	// Credentials: CREATE SECRET (TYPE datadog, API_KEY '...', APP_KEY '...', SITE '...').
 	RegisterDatadogSecretType(loader);
+	// Catalog: ATTACH 'datadog:' AS dd (TYPE datadog, SECRET '...', INDEXES [...]).
+	RegisterDatadogCatalog(loader);
 	// Reader: SELECT * FROM read_datadog_logs(query => '...', "from" => 'now-1h', "to" => 'now').
 	RegisterDatadogLogsFunction(loader);
 }

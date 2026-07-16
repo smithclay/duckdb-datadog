@@ -33,7 +33,8 @@ endif()
 include_directories(src/include)
 
 set(EXTENSION_SOURCES src/datadog_extension.cpp src/datadog_secret.cpp
-                      src/datadog_client.cpp src/logs_table.cpp)
+                      src/datadog_client.cpp src/datadog_json.cpp
+                      src/logs_table.cpp src/datadog_catalog.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
@@ -47,6 +48,21 @@ foreach(target ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
   target_compile_definitions(${target} PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
   target_link_libraries(${target} OpenSSL::SSL OpenSSL::Crypto)
 endforeach()
+
+# Small offline helper test for JSON discovery parsing and search request generation. It is
+# intentionally a C++ test rather than a test-only SQL function, keeping internals out of the
+# extension's public SQL surface.
+add_executable(datadog_json_test EXCLUDE_FROM_ALL
+                                 test/cpp/datadog_json_test.cpp
+                                 src/datadog_json.cpp)
+target_include_directories(
+  datadog_json_test PRIVATE src/include
+                             "${DATADOG_DUCKDB_DIR}/third_party/yyjson/include")
+target_link_libraries(datadog_json_test dummy_static_extension_loader duckdb_static)
+set_target_properties(
+  datadog_json_test
+  PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+             "${CMAKE_BINARY_DIR}/extension/datadog")
 
 install(
   TARGETS ${EXTENSION_NAME}

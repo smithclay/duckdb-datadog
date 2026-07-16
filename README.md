@@ -32,6 +32,56 @@ SELECT * FROM read_datadog_logs(
 `API_KEY` needs the `logs_read_data` permission. `from`/`to` accept anything the Datadog API
 accepts: relative like `now-1h`, epoch milliseconds, or ISO-8601.
 
+## Datadog catalog
+
+Attach a Datadog account as a read-only DuckDB catalog to query each log index as a table in its
+`logs` schema:
+
+```sql
+LOAD datadog;
+
+CREATE SECRET dd_prod (
+    TYPE datadog,
+    API_KEY '<dd-api-key>',
+    APP_KEY '<dd-application-key>',
+    SITE 'datadoghq.com'
+);
+
+ATTACH 'datadog:' AS dd (
+    TYPE datadog,
+    SECRET 'dd_prod'
+);
+
+SELECT * FROM dd.logs.main LIMIT 10;
+
+-- Index names are preserved exactly; quote names that are not plain SQL identifiers.
+SELECT * FROM dd.logs."security-events" LIMIT 10;
+```
+
+Without `INDEXES`, `ATTACH` calls Datadog's log-index configuration endpoint once and caches the
+returned index list for the lifetime of the attachment. Automatic discovery requires
+`logs_read_config`; searching any catalog table requires `logs_read_data`.
+
+Supply a `VARCHAR[]` when discovery is unavailable or when deterministic, network-free attachment
+is preferable:
+
+```sql
+ATTACH 'datadog:' AS dd (
+    TYPE datadog,
+    SECRET 'dd_prod',
+    INDEXES ['main', 'security-events']
+);
+```
+
+When `INDEXES` is present, attachment makes no network request. Duplicate names are ignored while
+input order and spelling are preserved. Omitting `SECRET` uses the same first in-scope `datadog`
+secret selection as `read_datadog_logs`.
+
+Every catalog table has the same 18-column schema as `read_datadog_logs` and uses the reader's
+current defaults: query `*`, from `now-15m` to `now`. The catalog is read-only. Use
+`read_datadog_logs` when you need a custom query, time window, page size, row cap, retry budget, or
+timeout.
+
 ### `read_datadog_logs` parameters
 
 | Parameter   | Type    | Default    | Description |
@@ -114,3 +164,9 @@ DD_API_KEY=... DD_APP_KEY=... test/e2e/run_e2e.sh
 ```
 
 Because Datadog ingestion has indexing latency, the script polls for up to ~150s.
+
+The automated end-to-end test intentionally exercises `read_datadog_logs` and therefore does not
+require `logs_read_config`. To verify live catalog discovery manually with credentials that have
+both `logs_read_data` and `logs_read_config`, create a secret as above, omit `INDEXES` from the
+`ATTACH`, then run `SELECT * FROM dd.logs.main LIMIT 10` (substituting an index present in the
+account).

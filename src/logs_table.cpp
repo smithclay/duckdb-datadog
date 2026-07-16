@@ -1,11 +1,13 @@
 #include "logs_table.hpp"
 
 #include "datadog_client.hpp"
+#include "datadog_json.hpp"
 #include "datadog_secret.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
@@ -59,7 +61,7 @@ static constexpr idx_t COL_RESOURCE_ATTRS = 11;
 static constexpr idx_t COL_LOG_ATTRS = 15;
 static constexpr idx_t COLUMN_COUNT = 18;
 
-static void GetLogsSchema(vector<LogicalType> &types, vector<string> &names) {
+void GetDatadogLogsSchema(vector<LogicalType> &types, vector<string> &names) {
 	names = {"time_unix_nano",
 	         "observed_time_unix_nano",
 	         "trace_id",
@@ -189,33 +191,6 @@ static string BuildResourceAttributes(yyjson_val *attributes) {
 	return json ? string(json.get()) : string();
 }
 
-//! Build the POST body for /api/v2/logs/events/search.
-static string BuildSearchBody(const string &query, const string &from, const string &to, int64_t limit,
-                              const string &cursor) {
-	YyjsonMutDocPtr doc(yyjson_mut_doc_new(nullptr));
-	yyjson_mut_val *root = yyjson_mut_obj(doc.get());
-	yyjson_mut_doc_set_root(doc.get(), root);
-
-	yyjson_mut_val *filter = yyjson_mut_obj(doc.get());
-	yyjson_mut_obj_add_strcpy(doc.get(), filter, "query", query.c_str());
-	yyjson_mut_obj_add_strcpy(doc.get(), filter, "from", from.c_str());
-	yyjson_mut_obj_add_strcpy(doc.get(), filter, "to", to.c_str());
-	yyjson_mut_obj_add_val(doc.get(), root, "filter", filter);
-
-	// Ascending, stable sort so cursor pagination returns a deterministic ordering.
-	yyjson_mut_obj_add_strcpy(doc.get(), root, "sort", "timestamp");
-
-	yyjson_mut_val *page = yyjson_mut_obj(doc.get());
-	yyjson_mut_obj_add_int(doc.get(), page, "limit", limit);
-	if (!cursor.empty()) {
-		yyjson_mut_obj_add_strcpy(doc.get(), page, "cursor", cursor.c_str());
-	}
-	yyjson_mut_obj_add_val(doc.get(), root, "page", page);
-
-	YyjsonStrPtr json(yyjson_mut_write(doc.get(), 0, nullptr));
-	return json ? string(json.get()) : string();
-}
-
 //! Map one Datadog log event (`data[]` element) to the projected columns of a row.
 //! `column_ids[c]` is the source column for output slot c (projection pushdown); only projected
 //! columns are computed, so deselected fields — above all the log_attributes JSON serialization,
@@ -314,6 +289,8 @@ struct DatadogLogsBindData : public TableFunctionData {
 	string to = "now";
 	int64_t page_size = 1000; // rows per API request (Datadog max)
 	int64_t max_rows = 0;     // 0 = unlimited
+	vector<string> indexes;   // empty = search all indexes (existing table-function behavior)
+	TableCatalogEntry *table = nullptr;
 	DatadogClient client;
 };
 
@@ -341,7 +318,8 @@ struct DatadogLogsGlobalState : public GlobalTableFunctionState {
 //! exceed the API's cursor depth should be paged through by narrowing `from`/`to` at the call
 //! site (e.g. one hour at a time).
 static void FetchNextPage(ClientContext &context, const DatadogLogsBindData &bind, DatadogLogsGlobalState &state) {
-	string body = BuildSearchBody(bind.query, bind.from, bind.to, bind.page_size, state.cursor);
+	string body =
+	    BuildDatadogLogsSearchBody(bind.query, bind.from, bind.to, bind.page_size, state.cursor, bind.indexes);
 	string response = bind.client.SearchLogs(context, body);
 
 	YyjsonDocPtr doc(yyjson_read(response.c_str(), response.size(), 0));
@@ -423,7 +401,7 @@ static unique_ptr<FunctionData> DatadogLogsBind(ClientContext &context, TableFun
 	result->client.api_key = credentials.api_key;
 	result->client.app_key = credentials.app_key;
 
-	GetLogsSchema(return_types, names);
+	GetDatadogLogsSchema(return_types, names);
 	return std::move(result);
 }
 
@@ -483,6 +461,29 @@ void RegisterDatadogLogsFunction(ExtensionLoader &loader) {
 	// service_name never pays the per-row log_attributes JSON serialization.
 	function.projection_pushdown = true;
 	loader.RegisterFunction(function);
+}
+
+static BindInfo DatadogLogsGetBindInfo(const optional_ptr<FunctionData> bind_data) {
+	auto &data = bind_data->Cast<DatadogLogsBindData>();
+	D_ASSERT(data.table);
+	return BindInfo(*data.table);
+}
+
+TableFunction GetDatadogLogsTableScan(ClientContext &context, TableCatalogEntry &table, const string &secret_name,
+                                      const string &index_name, unique_ptr<FunctionData> &bind_data) {
+	auto result = make_uniq<DatadogLogsBindData>();
+	result->indexes.push_back(index_name);
+	result->table = &table;
+	auto credentials = GetDatadogCredentials(context, secret_name);
+	result->client.site = credentials.site;
+	result->client.api_key = credentials.api_key;
+	result->client.app_key = credentials.app_key;
+	bind_data = std::move(result);
+
+	TableFunction function("datadog_logs_scan", {}, DatadogLogsScan, nullptr, DatadogLogsInitGlobal);
+	function.projection_pushdown = true;
+	function.get_bind_info = DatadogLogsGetBindInfo;
+	return function;
 }
 
 } // namespace duckdb

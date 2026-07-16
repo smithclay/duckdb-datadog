@@ -22,6 +22,13 @@ SELECT * FROM read_datadog_logs(query => '*', "from" => 'now-15m', "to" => 'now'
 ----
 No 'datadog' secret found
 
+# Catalog attachment validates credentials before doing anything else. Explicit INDEXES keeps
+# this path offline while preserving the same helpful missing-secret error.
+statement error
+ATTACH 'datadog:' AS dd_missing (TYPE datadog, INDEXES ['main']);
+----
+No 'datadog' secret found
+
 # The custom secret type works.
 statement ok
 CREATE SECRET dd_test (
@@ -89,3 +96,123 @@ statement error
 SELECT * FROM read_datadog_logs("limit" => 10);
 ----
 Invalid named parameter
+
+# Explicit indexes bypass network discovery entirely. Duplicate names are removed in input order.
+statement ok
+ATTACH 'datadog:' AS dd (
+    TYPE datadog,
+    SECRET 'dd_test',
+    INDEXES ['main', 'security-events', 'main']
+);
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'dd' AND schema_name = 'logs';
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dd' AND schema_name = 'logs';
+----
+2
+
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name = 'dd' AND schema_name = 'logs' AND table_name = 'main';
+----
+1
+
+query I rowsort
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'dd' AND schema_name = 'logs';
+----
+main
+security-events
+
+# Catalog tables and the stable table function expose exactly the same 18 columns and types.
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM dd.logs.main);
+----
+18
+
+query I
+SELECT count(*)
+FROM (
+    (SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM dd.logs.main))
+    EXCEPT ALL
+    (SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_datadog_logs()))
+);
+----
+0
+
+# Datadog index names are preserved and names requiring quoting bind normally.
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM dd.logs."security-events");
+----
+18
+
+# Explicit names must be non-null and non-empty.
+statement error
+ATTACH 'datadog:' AS dd_null (TYPE datadog, SECRET 'dd_test', INDEXES ['main', NULL]);
+----
+INDEXES must contain only non-null VARCHAR names
+
+statement error
+ATTACH 'datadog:' AS dd_empty (TYPE datadog, SECRET 'dd_test', INDEXES ['']);
+----
+INDEXES must not contain empty index names
+
+# Unknown storage options fail at attach time with a useful allow-list.
+statement error
+ATTACH 'datadog:' AS dd_bad_option (TYPE datadog, SECRET 'dd_test', INDEXES ['main'], FOO 'bar');
+----
+Unsupported Datadog ATTACH option 'foo'
+
+# The attached catalog is genuinely read-only across DDL and DML paths.
+statement error
+CREATE TABLE dd.logs.nope(i INTEGER);
+----
+read-only
+
+statement error
+DROP TABLE dd.logs.main;
+----
+read-only
+
+statement error
+ALTER TABLE dd.logs.main RENAME TO renamed;
+----
+read-only
+
+statement error
+INSERT INTO dd.logs.main (body) VALUES ('not allowed');
+----
+read-only
+
+statement error
+UPDATE dd.logs.main SET body = 'not allowed';
+----
+read-only
+
+statement error
+DELETE FROM dd.logs.main;
+----
+read-only
+
+statement ok
+DETACH dd;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dd';
+----
+0
+
+# Omitting SECRET uses the same first in-scope Datadog secret selection as the table function.
+statement ok
+ATTACH 'datadog:' AS dd_default (TYPE datadog, INDEXES ['main']);
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dd_default' AND table_name = 'main';
+----
+1
+
+statement ok
+DETACH dd_default;

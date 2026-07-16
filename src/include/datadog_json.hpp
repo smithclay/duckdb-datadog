@@ -30,10 +30,11 @@ vector<string> ParseDatadogLogIndexes(const string &response_json);
 //! The original query is unchanged when there are no pushed terms.
 string BuildDatadogSearchQuery(const string &query, const vector<string> &query_terms);
 
-//! Resolve pushed timestamp bounds against the reader's default now-15m..now
-//! window at scan initialization. Custom windows remain unchanged.
+//! Resolve pushed timestamp bounds against an explicit epoch-millisecond request
+//! window. Relative and ISO-8601 windows remain unchanged so their server-side
+//! interpretation is preserved.
 DatadogResolvedSearch ResolveDatadogSearch(const string &query, const string &from, const string &to,
-                                           const DatadogFilterPushdown &pushdown, int64_t now_ms);
+                                           const DatadogFilterPushdown &pushdown);
 
 //! Build the POST body used by the Datadog Logs Search API. The indexes field is
 //! omitted when `indexes` is empty so read_datadog_logs retains its existing request shape.

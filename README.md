@@ -94,10 +94,13 @@ WHERE service_name = 'edge'
 ```
 
 Literal equality on `service_name` and `severity_text` becomes Datadog `service:` and `status:`
-search terms. Literal `>`, `>=`, `<`, and `<=` bounds on `time_unix_nano` narrow the default
-15-minute request window. `AND` combinations are supported. Other predicates—including `OR`,
-`NOT`, `IN`, `LIKE`, regular expressions, JSON expressions, and non-literal comparisons—remain
-local DuckDB filters.
+search terms. `AND` combinations are supported. Timestamp predicates remain local for catalog
+tables because their `now-15m` to `now` window is evaluated by Datadog when the request arrives;
+rewriting those relative endpoints with the client clock could shift the window. For
+`read_datadog_logs`, literal `>`, `>=`, `<`, and `<=` bounds on `time_unix_nano` additionally narrow
+the request when both `from` and `to` are explicit epoch-millisecond values. Other
+predicates—including `OR`, `NOT`, `IN`, `LIKE`, regular expressions, JSON expressions, and
+non-literal comparisons—remain local DuckDB filters.
 
 ### `read_datadog_logs` parameters
 

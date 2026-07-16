@@ -339,6 +339,11 @@ static unique_ptr<Catalog> AttachDatadog(optional_ptr<StorageExtensionInfo>, Cli
 	// Always validate/select the secret at attach time, but retain only its name. Explicit
 	// INDEXES never performs a network request.
 	auto credentials = GetDatadogCredentials(context, secret_name);
+	// Pin implicit selection to the same secret used at attach time. Leaving the name empty would
+	// re-run first-secret selection at every table bind and could silently switch accounts.
+	if (secret_name.empty()) {
+		secret_name = credentials.name;
+	}
 	if (!indexes_supplied) {
 		DatadogClient client;
 		client.site = credentials.site;

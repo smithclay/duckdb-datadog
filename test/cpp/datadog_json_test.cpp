@@ -49,32 +49,37 @@ int main() {
 		pushed.lower_bound_ms = 1500000;
 		pushed.has_upper_bound_ms = true;
 		pushed.upper_bound_ms = 1750000;
-		auto resolved = ResolveDatadogSearch("*", "now-15m", "now", pushed, 2000000);
+		auto resolved = ResolveDatadogSearch("*", "now-15m", "now", pushed);
 		Require(resolved.query == "service:edge AND status:error", "resolved search should contain pushed terms");
-		Require(resolved.from == "1500000" && resolved.to == "1750000",
-		        "timestamp predicates should tighten the default window");
-		Require(!resolved.empty, "overlapping timestamp predicates should not make the search empty");
+		Require(resolved.from == "now-15m" && resolved.to == "now",
+		        "timestamp predicates must preserve server-relative request bounds");
+		Require(!resolved.empty, "relative request bounds must not be declared empty using the client clock");
 		auto pushed_body = BuildDatadogLogsSearchBody(resolved.query, resolved.from, resolved.to, 1000, "", {"main"});
 		Require(pushed_body.find("\"query\":\"service:edge AND status:error\"") != string::npos,
 		        "search request should contain translated service and status predicates");
-		Require(pushed_body.find("\"from\":\"1500000\"") != string::npos &&
-		            pushed_body.find("\"to\":\"1750000\"") != string::npos,
-		        "search request should contain tightened timestamp bounds");
+		Require(pushed_body.find("\"from\":\"now-15m\"") != string::npos &&
+		            pushed_body.find("\"to\":\"now\"") != string::npos,
+		        "search request should retain relative timestamp bounds");
+
+		resolved = ResolveDatadogSearch("*", "1100000", "2000000", pushed);
+		Require(resolved.from == "1500000" && resolved.to == "1750000",
+		        "timestamp predicates should tighten an absolute epoch-millisecond window");
+		Require(!resolved.empty, "overlapping absolute timestamp predicates should not make the search empty");
 
 		pushed.lower_bound_ms = 0;
 		pushed.upper_bound_ms = 3000000;
-		resolved = ResolveDatadogSearch("*", "now-15m", "now", pushed, 2000000);
+		resolved = ResolveDatadogSearch("*", "1100000", "2000000", pushed);
 		Require(resolved.from == "1100000" && resolved.to == "2000000",
-		        "pushed timestamps must not widen the default 15-minute window");
+		        "pushed timestamps must not widen an absolute request window");
 
-		resolved = ResolveDatadogSearch("*", "2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z", pushed, 2000000);
+		resolved = ResolveDatadogSearch("*", "2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z", pushed);
 		Require(resolved.from == "2026-01-01T00:00:00Z" && resolved.to == "2026-01-01T01:00:00Z",
-		        "custom time windows should remain unchanged");
+		        "ISO-8601 time windows should retain server-side interpretation");
 
 		pushed.lower_bound_ms = 1800000;
 		pushed.upper_bound_ms = 1700000;
-		Require(ResolveDatadogSearch("*", "now-15m", "now", pushed, 2000000).empty,
-		        "disjoint pushed timestamp predicates should avoid a network request");
+		Require(ResolveDatadogSearch("*", "1100000", "2000000", pushed).empty,
+		        "disjoint pushed timestamps in an absolute window should avoid a network request");
 	} catch (const std::exception &error) {
 		std::cerr << "datadog_json_test failed: " << error.what() << std::endl;
 		return 1;

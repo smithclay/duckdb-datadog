@@ -141,6 +141,14 @@ WHERE service_name = 'edge'
   AND severity_text = 'error'
   AND time_unix_nano >= TIMESTAMP_NS '2026-01-01 00:00:00';
 
+# max_rows caps the table function before SQL WHERE evaluation, so remote pushdown must be
+# disabled or it would change which rows participate in the cap.
+query II
+EXPLAIN (FORMAT JSON)
+SELECT body FROM read_datadog_logs(max_rows => 1) WHERE service_name = 'edge';
+----
+physical_plan	<REGEX>:.*"Datadog Query": "[*]".*
+
 # Unsupported shapes remain ordinary local DuckDB filters.
 statement ok
 EXPLAIN SELECT body FROM dd.logs.main
@@ -227,5 +235,25 @@ SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dd_default' AND tabl
 ----
 1
 
+# The implicit selection is pinned at ATTACH. Replacing the available secrets must not silently
+# redirect this catalog to another Datadog account.
+statement ok
+CREATE SECRET dd_other (
+    TYPE datadog,
+    API_KEY 'OTHER_API_KEY_VALUE',
+    APP_KEY 'OTHER_APP_KEY_VALUE'
+);
+
+statement ok
+DROP SECRET dd_test;
+
+statement error
+DESCRIBE SELECT * FROM dd_default.logs.main;
+----
+No secret with name 'dd_test' found
+
 statement ok
 DETACH dd_default;
+
+statement ok
+DROP SECRET dd_other;

@@ -75,6 +75,7 @@ DatadogCredentials GetDatadogCredentials(ClientContext &context, const string &s
 	}
 
 	DatadogCredentials creds;
+	creds.name = base_secret.GetName();
 	Value value;
 	if (kv_secret->TryGetValue("api_key", value) && !value.IsNull()) {
 		creds.api_key = value.ToString();

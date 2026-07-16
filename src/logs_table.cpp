@@ -19,7 +19,6 @@
 #include "yyjson.hpp"
 
 #include <cstdlib>
-#include <chrono>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -421,10 +420,7 @@ static unique_ptr<GlobalTableFunctionState> DatadogLogsInitGlobal(ClientContext 
 	auto state = make_uniq<DatadogLogsGlobalState>();
 	auto &bind = input.bind_data->Cast<DatadogLogsBindData>();
 	state->column_ids = input.column_ids;
-	auto now_ms =
-	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
-	        .count();
-	auto resolved = ResolveDatadogSearch(bind.query, bind.from, bind.to, bind.pushdown, now_ms);
+	auto resolved = ResolveDatadogSearch(bind.query, bind.from, bind.to, bind.pushdown);
 	state->request_query = std::move(resolved.query);
 	state->request_from = std::move(resolved.from);
 	state->request_to = std::move(resolved.to);
@@ -611,6 +607,11 @@ static void DatadogLogsPushdownComplexFilter(ClientContext &, LogicalGet &get, F
                                              vector<unique_ptr<Expression>> &filters) {
 	auto &bind = bind_data->Cast<DatadogLogsBindData>();
 	bind.pushdown = DatadogFilterPushdown();
+	// max_rows caps the unfiltered table-function input. Moving a WHERE predicate below that cap
+	// changes which rows participate, so no remote filters are valid for a capped scan.
+	if (bind.max_rows > 0) {
+		return;
+	}
 	for (const auto &filter : filters) {
 		TryPushDatadogExpression(get, *filter, bind.pushdown);
 	}
@@ -622,13 +623,14 @@ static void DatadogLogsPushdownComplexFilter(ClientContext &, LogicalGet &get, F
 static InsertionOrderPreservingMap<string> DatadogLogsToString(TableFunctionToStringInput &input) {
 	InsertionOrderPreservingMap<string> result;
 	auto &bind = input.bind_data->Cast<DatadogLogsBindData>();
+	auto resolved = ResolveDatadogSearch(bind.query, bind.from, bind.to, bind.pushdown);
 	result["Function"] = input.table_function.name;
-	result["Datadog Query"] = BuildDatadogSearchQuery(bind.query, bind.pushdown.query_terms);
-	if (bind.pushdown.has_lower_bound_ms) {
-		result["Datadog From Bound"] = std::to_string(bind.pushdown.lower_bound_ms);
+	result["Datadog Query"] = resolved.query;
+	if (resolved.from != bind.from) {
+		result["Datadog From"] = resolved.from;
 	}
-	if (bind.pushdown.has_upper_bound_ms) {
-		result["Datadog To Bound"] = std::to_string(bind.pushdown.upper_bound_ms);
+	if (resolved.to != bind.to) {
+		result["Datadog To"] = resolved.to;
 	}
 	return result;
 }

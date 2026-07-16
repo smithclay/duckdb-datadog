@@ -4,8 +4,8 @@
 
 #include "yyjson.hpp"
 
-#include <cstdlib>
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <unordered_set>
 
@@ -95,19 +95,45 @@ string BuildDatadogSearchQuery(const string &query, const vector<string> &query_
 	return "(" + query + ") AND " + pushed_query;
 }
 
+static bool TryParseEpochMilliseconds(const string &value, int64_t &result) {
+	if (value.empty()) {
+		return false;
+	}
+	idx_t offset = value[0] == '-' ? 1 : 0;
+	if (offset == value.size()) {
+		return false;
+	}
+	for (idx_t i = offset; i < value.size(); i++) {
+		if (value[i] < '0' || value[i] > '9') {
+			return false;
+		}
+	}
+	try {
+		result = std::stoll(value);
+		return true;
+	} catch (const std::exception &) {
+		return false;
+	}
+}
+
 DatadogResolvedSearch ResolveDatadogSearch(const string &query, const string &from, const string &to,
-                                           const DatadogFilterPushdown &pushdown, int64_t now_ms) {
+                                           const DatadogFilterPushdown &pushdown) {
 	DatadogResolvedSearch result;
 	result.query = BuildDatadogSearchQuery(query, pushdown.query_terms);
 	result.from = from;
 	result.to = to;
-	if ((!pushdown.has_lower_bound_ms && !pushdown.has_upper_bound_ms) || from != "now-15m" || to != "now") {
+	if (!pushdown.has_lower_bound_ms && !pushdown.has_upper_bound_ms) {
 		return result;
 	}
 
-	constexpr int64_t DEFAULT_WINDOW_MS = 15 * 60 * 1000;
-	int64_t lower_bound_ms = now_ms - DEFAULT_WINDOW_MS;
-	int64_t upper_bound_ms = now_ms;
+	// Datadog evaluates relative values such as `now-15m` and `now` on the server when it receives
+	// the request. Replacing either with a client-side timestamp shifts the source relation because
+	// of request latency and clock skew. Only an already-absolute window can be intersected exactly.
+	int64_t lower_bound_ms;
+	int64_t upper_bound_ms;
+	if (!TryParseEpochMilliseconds(from, lower_bound_ms) || !TryParseEpochMilliseconds(to, upper_bound_ms)) {
+		return result;
+	}
 	if (pushdown.has_lower_bound_ms) {
 		lower_bound_ms = std::max(lower_bound_ms, pushdown.lower_bound_ms);
 	}

@@ -22,9 +22,41 @@ struct DatadogResolvedSearch {
 	bool empty = false;
 };
 
+//! One currently triggered Datadog monitor group. Presence flags distinguish a missing/null API
+//! field from a legitimate empty value so catalog scans can preserve SQL NULL semantics.
+struct DatadogOpenAlertGroup {
+	bool has_monitor_id = false;
+	int64_t monitor_id = 0;
+	bool has_monitor_name = false;
+	string monitor_name;
+	bool has_group = false;
+	string group;
+	bool has_group_tags = false;
+	vector<string> group_tags;
+	bool has_status = false;
+	string status;
+	bool has_last_triggered_ts = false;
+	int64_t last_triggered_ts = 0;
+	bool has_last_nodata_ts = false;
+	int64_t last_nodata_ts = 0;
+};
+
+struct DatadogOpenAlertsPage {
+	vector<DatadogOpenAlertGroup> groups;
+	bool has_total_count = false;
+	int64_t total_count = 0;
+};
+
 //! Parse GET /api/v1/logs/config/indexes, validating every returned index name and
 //! deduplicating exact names while preserving response order.
 vector<string> ParseDatadogLogIndexes(const string &response_json);
+
+//! Build a paginated monitor-group search path for Datadog's definition of triggered/open:
+//! group status Alert, Warn, or No Data.
+string BuildDatadogOpenAlertsPath(int64_t page, int64_t per_page);
+
+//! Parse one response from /api/v1/monitor/groups/search.
+DatadogOpenAlertsPage ParseDatadogOpenAlertsPage(const string &response_json);
 
 //! Combine the user's query with conservative query terms translated from SQL.
 //! The original query is unchanged when there are no pushed terms.

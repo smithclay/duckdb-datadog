@@ -1,11 +1,12 @@
 # duckdb-datadog
 
-A DuckDB extension that reads logs from the [Datadog Logs Search API v2](https://docs.datadoghq.com/api/latest/logs/)
-directly into DuckDB tables. Rows conform to the
+A DuckDB extension that reads logs and open monitor alerts from Datadog directly into DuckDB
+tables. Log rows come from the [Datadog Logs Search API v2](https://docs.datadoghq.com/api/latest/logs/)
+and conform to the
 [duckdb-otlp](https://github.com/smithclay/otlp2records) `read_otlp_logs` schema, so Datadog logs
 drop straight into an OTLP-shaped lakehouse alongside data from other sources.
 
-Logs are supported today; traces/spans and metrics are planned.
+Logs and open monitor alerts are supported today; traces/spans and metrics are planned.
 
 ## Quick start
 
@@ -56,6 +57,9 @@ SELECT * FROM dd.logs.main LIMIT 10;
 
 -- Index names are preserved exactly; quote names that are not plain SQL identifiers.
 SELECT * FROM dd.logs."security-events" LIMIT 10;
+
+-- One row per currently triggered monitor group.
+SELECT * FROM dd.alerts.open ORDER BY last_triggered_at DESC;
 ```
 
 Without `INDEXES`, `ATTACH` calls Datadog's log-index configuration endpoint once and caches the
@@ -77,10 +81,29 @@ When `INDEXES` is present, attachment makes no network request. Duplicate names 
 input order and spelling are preserved. Omitting `SECRET` uses the same first in-scope `datadog`
 secret selection as `read_datadog_logs`.
 
-Every catalog table has the same 18-column schema as `read_datadog_logs` and uses the reader's
+Every catalog log table has the same 18-column schema as `read_datadog_logs` and uses the reader's
 current defaults: query `*`, from `now-15m` to `now`, ascending `timestamp` sort, page size 1000,
 unlimited rows, four retries, and a 60-second request timeout. The catalog is read-only. Use
 `read_datadog_logs` when you need a custom query or time window.
+
+### Open alerts
+
+`dd.alerts.open` reads Datadog's triggered monitor groups. A grouped monitor contributes one row
+per reporting group, so (for example) 14 triggered hosts remain 14 independently actionable
+alerts rather than collapsing into one monitor-level status. The table includes all states Datadog
+defines as triggered: `Alert`, `Warn`, and `No Data`.
+
+```sql
+SELECT monitor_id, monitor_name, group_name, group_tags, status,
+       last_triggered_at, last_nodata_at
+FROM dd.alerts.open
+ORDER BY last_triggered_at DESC NULLS LAST;
+```
+
+The alert table is fetched lazily when scanned and paginates through the Monitor Groups Search API.
+It requires the `monitors_read` application-key permission. `RETRIES` and `TIMEOUT` from `ATTACH`
+apply to alert requests as well as log requests. Datadog reports a zero timestamp when a group has
+never entered a state; the table exposes those sentinel values as SQL `NULL`.
 
 For a bounded latest-logs relation suitable for an interactive browser query, configure the
 attachment explicitly:

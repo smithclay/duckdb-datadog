@@ -32,7 +32,8 @@ include_directories(src/include)
 
 set(EXTENSION_SOURCES src/datadog_extension.cpp src/datadog_secret.cpp
                       src/datadog_client.cpp src/datadog_json.cpp
-                      src/logs_table.cpp src/datadog_catalog.cpp)
+                      src/logs_table.cpp src/alerts_table.cpp
+                      src/datadog_catalog.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

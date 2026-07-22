@@ -14,8 +14,8 @@ void GetDatadogOpenAlertsSchema(vector<LogicalType> &types, vector<string> &name
 
 //! Create the already-bound scan for `alerts.open`. Credentials are resolved at table bind time,
 //! matching the catalog log tables and preserving secret replacement semantics.
-TableFunction GetDatadogOpenAlertsTableScan(ClientContext &context, TableCatalogEntry &table,
-                                            const string &secret_name, int64_t retries, int64_t timeout_seconds,
+TableFunction GetDatadogOpenAlertsTableScan(ClientContext &context, TableCatalogEntry &table, const string &secret_name,
+                                            int64_t retries, int64_t timeout_seconds,
                                             unique_ptr<FunctionData> &bind_data);
 
 } // namespace duckdb

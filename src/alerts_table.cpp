@@ -41,8 +41,7 @@ struct DatadogOpenAlertsGlobalState : public GlobalTableFunctionState {
 };
 
 static bool IsOpenStatus(const DatadogOpenAlertGroup &group) {
-	return group.has_status &&
-	       (group.status == "Alert" || group.status == "Warn" || group.status == "No Data");
+	return group.has_status && (group.status == "Alert" || group.status == "Warn" || group.status == "No Data");
 }
 
 static Value ToVarcharList(const vector<string> &strings) {
@@ -54,8 +53,7 @@ static Value ToVarcharList(const vector<string> &strings) {
 	return Value::LIST(LogicalType::VARCHAR, std::move(values));
 }
 
-static void MapOpenAlert(const DatadogOpenAlertGroup &group, const vector<column_t> &column_ids,
-                         vector<Value> &row) {
+static void MapOpenAlert(const DatadogOpenAlertGroup &group, const vector<column_t> &column_ids, vector<Value> &row) {
 	row.assign(column_ids.size(), Value());
 	for (idx_t output_column = 0; output_column < column_ids.size(); output_column++) {
 		switch (column_ids[output_column]) {
@@ -173,15 +171,15 @@ static InsertionOrderPreservingMap<string> DatadogOpenAlertsToString(TableFuncti
 } // namespace
 
 void GetDatadogOpenAlertsSchema(vector<LogicalType> &types, vector<string> &names) {
-	names = {"monitor_id", "monitor_name", "group_name", "group_tags", "status", "last_triggered_at",
-	         "last_nodata_at"};
-	types = {LogicalType::BIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR),
-	         LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::TIMESTAMP};
+	names = {"monitor_id", "monitor_name", "group_name", "group_tags", "status", "last_triggered_at", "last_nodata_at"};
+	types = {
+	    LogicalType::BIGINT,  LogicalType::VARCHAR,   LogicalType::VARCHAR,  LogicalType::LIST(LogicalType::VARCHAR),
+	    LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::TIMESTAMP};
 	D_ASSERT(names.size() == COLUMN_COUNT && types.size() == COLUMN_COUNT);
 }
 
-TableFunction GetDatadogOpenAlertsTableScan(ClientContext &context, TableCatalogEntry &table,
-                                            const string &secret_name, int64_t retries, int64_t timeout_seconds,
+TableFunction GetDatadogOpenAlertsTableScan(ClientContext &context, TableCatalogEntry &table, const string &secret_name,
+                                            int64_t retries, int64_t timeout_seconds,
                                             unique_ptr<FunctionData> &bind_data) {
 	auto result = make_uniq<DatadogOpenAlertsBindData>();
 	result->table = &table;
@@ -193,8 +191,7 @@ TableFunction GetDatadogOpenAlertsTableScan(ClientContext &context, TableCatalog
 	result->client.app_key = credentials.app_key;
 	bind_data = std::move(result);
 
-	TableFunction function("datadog_open_alerts_scan", {}, DatadogOpenAlertsScan, nullptr,
-	                       DatadogOpenAlertsInitGlobal);
+	TableFunction function("datadog_open_alerts_scan", {}, DatadogOpenAlertsScan, nullptr, DatadogOpenAlertsInitGlobal);
 	function.projection_pushdown = true;
 	function.to_string = DatadogOpenAlertsToString;
 	function.get_bind_info = DatadogOpenAlertsGetBindInfo;

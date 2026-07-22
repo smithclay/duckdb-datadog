@@ -53,8 +53,7 @@ static bool ReadOptionalString(yyjson_val *object, const char *key, string &resu
 		return false;
 	}
 	if (!yyjson_is_str(value)) {
-		throw IOException("Datadog open alerts returned malformed data: %s.%s must be a string or null", location,
-		                  key);
+		throw IOException("Datadog open alerts returned malformed data: %s.%s must be a string or null", location, key);
 	}
 	result = yyjson_get_str(value);
 	return true;
@@ -100,8 +99,7 @@ DatadogOpenAlertsPage ParseDatadogOpenAlertsPage(const string &response_json) {
 		group.has_monitor_name = ReadOptionalString(item, "monitor_name", group.monitor_name, location);
 		group.has_group = ReadOptionalString(item, "group", group.group, location);
 		group.has_status = ReadOptionalString(item, "status", group.status, location);
-		group.has_last_triggered_ts =
-		    ReadOptionalInt64(item, "last_triggered_ts", group.last_triggered_ts, location);
+		group.has_last_triggered_ts = ReadOptionalInt64(item, "last_triggered_ts", group.last_triggered_ts, location);
 		group.has_last_nodata_ts = ReadOptionalInt64(item, "last_nodata_ts", group.last_nodata_ts, location);
 
 		auto tags = yyjson_obj_get(item, "group_tags");
@@ -115,9 +113,8 @@ DatadogOpenAlertsPage ParseDatadogOpenAlertsPage(const string &response_json) {
 			yyjson_val *tag;
 			yyjson_arr_foreach(tags, tag_index, tag_max, tag) {
 				if (!yyjson_is_str(tag)) {
-					throw IOException(
-					    "Datadog open alerts returned malformed data: %s.group_tags[%d] must be a string", location,
-					    tag_index);
+					throw IOException("Datadog open alerts returned malformed data: %s.group_tags[%d] must be a string",
+					                  location, tag_index);
 				}
 				group.group_tags.emplace_back(yyjson_get_str(tag));
 			}

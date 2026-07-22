@@ -38,6 +38,106 @@ using YyjsonStrPtr = std::unique_ptr<char, YyjsonFreeDeleter>;
 
 } // namespace
 
+string BuildDatadogOpenAlertsPath(int64_t page, int64_t per_page) {
+	// Datadog's Triggered Monitors page defines an open alert as a monitor group in Alert, Warn,
+	// or No Data. Keep the fixed query percent-encoded because cpp-httplib expects an HTTP target,
+	// while DuckDB-WASM's HTTPUtil expects the same value as part of a full URL.
+	return "/api/v1/monitor/groups/search?query="
+	       "group_status%3A%28Alert%20OR%20Warn%20OR%20%22No%20Data%22%29&page=" +
+	       std::to_string(page) + "&per_page=" + std::to_string(per_page);
+}
+
+static bool ReadOptionalString(yyjson_val *object, const char *key, string &result, const string &location) {
+	auto value = yyjson_obj_get(object, key);
+	if (!value || yyjson_is_null(value)) {
+		return false;
+	}
+	if (!yyjson_is_str(value)) {
+		throw IOException("Datadog open alerts returned malformed data: %s.%s must be a string or null", location,
+		                  key);
+	}
+	result = yyjson_get_str(value);
+	return true;
+}
+
+static bool ReadOptionalInt64(yyjson_val *object, const char *key, int64_t &result, const string &location) {
+	auto value = yyjson_obj_get(object, key);
+	if (!value || yyjson_is_null(value)) {
+		return false;
+	}
+	if (!yyjson_is_int(value)) {
+		throw IOException("Datadog open alerts returned malformed data: %s.%s must be an integer or null", location,
+		                  key);
+	}
+	result = yyjson_get_sint(value);
+	return true;
+}
+
+DatadogOpenAlertsPage ParseDatadogOpenAlertsPage(const string &response_json) {
+	YyjsonDocPtr doc(yyjson_read(response_json.c_str(), response_json.size(), 0));
+	if (!doc) {
+		throw IOException("Datadog open alerts returned a response that is not valid JSON");
+	}
+	auto root = yyjson_doc_get_root(doc.get());
+	if (!root || !yyjson_is_obj(root)) {
+		throw IOException("Datadog open alerts returned malformed data: expected a top-level object");
+	}
+	auto groups = yyjson_obj_get(root, "groups");
+	if (!groups || !yyjson_is_arr(groups)) {
+		throw IOException("Datadog open alerts returned malformed data: expected a 'groups' array");
+	}
+
+	DatadogOpenAlertsPage result;
+	size_t index, max;
+	yyjson_val *item;
+	yyjson_arr_foreach(groups, index, max, item) {
+		if (!item || !yyjson_is_obj(item)) {
+			throw IOException("Datadog open alerts returned malformed data: groups[%d] is not an object", index);
+		}
+		DatadogOpenAlertGroup group;
+		auto location = "groups[" + std::to_string(index) + "]";
+		group.has_monitor_id = ReadOptionalInt64(item, "monitor_id", group.monitor_id, location);
+		group.has_monitor_name = ReadOptionalString(item, "monitor_name", group.monitor_name, location);
+		group.has_group = ReadOptionalString(item, "group", group.group, location);
+		group.has_status = ReadOptionalString(item, "status", group.status, location);
+		group.has_last_triggered_ts =
+		    ReadOptionalInt64(item, "last_triggered_ts", group.last_triggered_ts, location);
+		group.has_last_nodata_ts = ReadOptionalInt64(item, "last_nodata_ts", group.last_nodata_ts, location);
+
+		auto tags = yyjson_obj_get(item, "group_tags");
+		if (tags && !yyjson_is_null(tags)) {
+			if (!yyjson_is_arr(tags)) {
+				throw IOException("Datadog open alerts returned malformed data: %s.group_tags must be an array or null",
+				                  location);
+			}
+			group.has_group_tags = true;
+			size_t tag_index, tag_max;
+			yyjson_val *tag;
+			yyjson_arr_foreach(tags, tag_index, tag_max, tag) {
+				if (!yyjson_is_str(tag)) {
+					throw IOException(
+					    "Datadog open alerts returned malformed data: %s.group_tags[%d] must be a string", location,
+					    tag_index);
+				}
+				group.group_tags.emplace_back(yyjson_get_str(tag));
+			}
+		}
+		result.groups.push_back(std::move(group));
+	}
+
+	auto metadata = yyjson_obj_get(root, "metadata");
+	if (metadata && !yyjson_is_null(metadata)) {
+		if (!yyjson_is_obj(metadata)) {
+			throw IOException("Datadog open alerts returned malformed data: metadata must be an object or null");
+		}
+		result.has_total_count = ReadOptionalInt64(metadata, "total_count", result.total_count, "metadata");
+		if (result.has_total_count && result.total_count < 0) {
+			throw IOException("Datadog open alerts returned malformed data: metadata.total_count must be non-negative");
+		}
+	}
+	return result;
+}
+
 vector<string> ParseDatadogLogIndexes(const string &response_json) {
 	YyjsonDocPtr doc(yyjson_read(response_json.c_str(), response_json.size(), 0));
 	if (!doc) {

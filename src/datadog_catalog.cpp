@@ -1,5 +1,6 @@
 #include "datadog_catalog.hpp"
 
+#include "alerts_table.hpp"
 #include "datadog_client.hpp"
 #include "datadog_json.hpp"
 #include "datadog_secret.hpp"
@@ -175,11 +176,135 @@ private:
 	vector<unique_ptr<DatadogTableEntry>> tables;
 };
 
+class DatadogOpenAlertsTableEntry : public TableCatalogEntry {
+public:
+	DatadogOpenAlertsTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, const string &secret_name,
+	                            const DatadogLogsSettings &settings)
+	    : DatadogOpenAlertsTableEntry(catalog, schema, secret_name, settings, CreateInfo(schema)) {
+	}
+
+	unique_ptr<BaseStatistics> GetStatistics(ClientContext &, column_t) override {
+		return nullptr;
+	}
+
+	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override {
+		return GetDatadogOpenAlertsTableScan(context, *this, secret_name, settings.retries, settings.timeout_seconds,
+		                                      bind_data);
+	}
+
+	TableStorageInfo GetStorageInfo(ClientContext &) override {
+		return TableStorageInfo();
+	}
+
+private:
+	DatadogOpenAlertsTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, const string &secret_name,
+	                            const DatadogLogsSettings &settings, CreateTableInfo info)
+	    : TableCatalogEntry(catalog, schema, info), secret_name(secret_name), settings(settings) {
+	}
+
+	static CreateTableInfo CreateInfo(SchemaCatalogEntry &schema) {
+		CreateTableInfo info(schema, "open");
+		vector<LogicalType> types;
+		vector<string> names;
+		GetDatadogOpenAlertsSchema(types, names);
+		for (idx_t i = 0; i < names.size(); i++) {
+			info.columns.AddColumn(ColumnDefinition(names[i], types[i]));
+		}
+		return info;
+	}
+
+	string secret_name;
+	DatadogLogsSettings settings;
+};
+
+class DatadogAlertsSchemaEntry : public SchemaCatalogEntry {
+public:
+	DatadogAlertsSchemaEntry(Catalog &catalog, const string &secret_name, const DatadogLogsSettings &settings)
+	    : DatadogAlertsSchemaEntry(catalog, secret_name, settings, CreateInfo()) {
+	}
+
+private:
+	DatadogAlertsSchemaEntry(Catalog &catalog, const string &secret_name, const DatadogLogsSettings &settings,
+	                         CreateSchemaInfo info)
+	    : SchemaCatalogEntry(catalog, info),
+	      open_table(make_uniq<DatadogOpenAlertsTableEntry>(catalog, *this, secret_name, settings)) {
+	}
+
+public:
+	void Scan(ClientContext &, CatalogType type, const std::function<void(CatalogEntry &)> &callback) override {
+		Scan(type, callback);
+	}
+
+	void Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) override {
+		if (type == CatalogType::TABLE_ENTRY) {
+			callback(*open_table);
+		}
+	}
+
+	optional_ptr<CatalogEntry> LookupEntry(CatalogTransaction, const EntryLookupInfo &lookup_info) override {
+		if (lookup_info.GetCatalogType() == CatalogType::TABLE_ENTRY &&
+		    StringUtil::CIEquals(lookup_info.GetEntryName(), "open")) {
+			return open_table.get();
+		}
+		return nullptr;
+	}
+
+	optional_ptr<CatalogEntry> CreateIndex(CatalogTransaction, CreateIndexInfo &, TableCatalogEntry &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateFunction(CatalogTransaction, CreateFunctionInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateTable(CatalogTransaction, BoundCreateTableInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateView(CatalogTransaction, CreateViewInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateSequence(CatalogTransaction, CreateSequenceInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateTableFunction(CatalogTransaction, CreateTableFunctionInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateCopyFunction(CatalogTransaction, CreateCopyFunctionInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreatePragmaFunction(CatalogTransaction, CreatePragmaFunctionInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateCollation(CatalogTransaction, CreateCollationInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateCoordinateSystem(CatalogTransaction, CreateCoordinateSystemInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateType(CatalogTransaction, CreateTypeInfo &) override {
+		ThrowReadOnly();
+	}
+	void DropEntry(ClientContext &, DropInfo &) override {
+		ThrowReadOnly();
+	}
+	void Alter(CatalogTransaction, AlterInfo &) override {
+		ThrowReadOnly();
+	}
+
+private:
+	static CreateSchemaInfo CreateInfo() {
+		CreateSchemaInfo info;
+		info.schema = "alerts";
+		return info;
+	}
+
+	unique_ptr<DatadogOpenAlertsTableEntry> open_table;
+};
+
 class DatadogCatalog : public Catalog {
 public:
 	DatadogCatalog(AttachedDatabase &db, vector<string> indexes, string secret_name,
 	               const DatadogLogsSettings &settings)
-	    : Catalog(db), logs_schema(make_uniq<DatadogSchemaEntry>(*this, indexes, secret_name, settings)) {
+	    : Catalog(db), logs_schema(make_uniq<DatadogSchemaEntry>(*this, indexes, secret_name, settings)),
+	      alerts_schema(make_uniq<DatadogAlertsSchemaEntry>(*this, secret_name, settings)) {
 	}
 
 	void Initialize(bool) override {
@@ -195,12 +320,16 @@ public:
 
 	void ScanSchemas(ClientContext &, std::function<void(SchemaCatalogEntry &)> callback) override {
 		callback(*logs_schema);
+		callback(*alerts_schema);
 	}
 
 	optional_ptr<SchemaCatalogEntry> LookupSchema(CatalogTransaction, const EntryLookupInfo &schema_lookup,
 	                                              OnEntryNotFound if_not_found) override {
 		if (StringUtil::CIEquals(schema_lookup.GetEntryName(), "logs")) {
 			return logs_schema.get();
+		}
+		if (StringUtil::CIEquals(schema_lookup.GetEntryName(), "alerts")) {
+			return alerts_schema.get();
 		}
 		if (if_not_found == OnEntryNotFound::THROW_EXCEPTION) {
 			throw CatalogException(schema_lookup.GetErrorContext(), "Schema with name %s does not exist!",
@@ -242,6 +371,7 @@ private:
 	}
 
 	unique_ptr<DatadogSchemaEntry> logs_schema;
+	unique_ptr<DatadogAlertsSchemaEntry> alerts_schema;
 };
 
 class DatadogTransaction : public Transaction {

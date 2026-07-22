@@ -1,9 +1,13 @@
 #include "datadog_client.hpp"
 
 #include "duckdb/common/exception.hpp"
+#ifdef __EMSCRIPTEN__
+#include "duckdb/common/http_util.hpp"
+#endif
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 
+#ifndef __EMSCRIPTEN__
 #include <chrono>
 #include <thread>
 
@@ -11,6 +15,7 @@
 // enables TLS and selects the `duckdb_httplib_openssl` namespace, so these symbols never collide
 // with core DuckDB's non-SSL `duckdb_httplib` build.
 #include "httplib.hpp"
+#endif
 
 namespace duckdb {
 
@@ -34,18 +39,46 @@ static string NormalizeSite(const string &raw) {
 }
 
 static string BuildBaseUrl(const string &site) {
+#ifdef __EMSCRIPTEN__
+	string browser_site = site;
+	StringUtil::Trim(browser_site);
+	while (!browser_site.empty() && browser_site.back() == '/') {
+		browser_site.pop_back();
+	}
+	if (StringUtil::StartsWith(browser_site, "https://") || StringUtil::StartsWith(browser_site, "http://")) {
+		return browser_site;
+	}
+#endif
 	return "https://api." + NormalizeSite(site);
 }
 
-// Defined here, where `Client` is complete, so the header's unique_ptr<Client> member can point at
-// a forward-declared type. Every special member the compiler might instantiate at a use site (where
-// Client is still incomplete) must be out-of-line: the default constructor and the destructor. The
-// destructor uses an empty body rather than `= default` to keep clang-tidy's
-// performance-trivially-destructible check quiet.
+#ifdef __EMSCRIPTEN__
+static string BrowserHTTPErrorDetail(const HTTPResponse &response) {
+	string detail = response.body.empty() ? response.GetError() : response.body;
+	StringUtil::Trim(detail);
+	for (auto &character : detail) {
+		if (character == '\r' || character == '\n' || character == '\t') {
+			character = ' ';
+		}
+	}
+	constexpr idx_t MAX_ERROR_DETAIL_LENGTH = 500;
+	if (detail.size() > MAX_ERROR_DETAIL_LENGTH) {
+		detail.resize(MAX_ERROR_DETAIL_LENGTH);
+		detail += "...";
+	}
+	return detail;
+}
+#endif
+
+// Native builds keep these special members out-of-line so the header can hold a unique_ptr to the
+// forward-declared httplib Client. The definitions are harmless in browser builds, where no native
+// connection member exists. The destructor uses an empty body rather than `= default` to keep
+// clang-tidy's performance-trivially-destructible check quiet.
 DatadogClient::DatadogClient() = default;
 DatadogClient::~DatadogClient() {
 }
 
+#ifndef __EMSCRIPTEN__
 duckdb_httplib_openssl::Client &DatadogClient::GetConnection() const {
 	if (!connection) {
 		connection = make_uniq<duckdb_httplib_openssl::Client>(BuildBaseUrl(site));
@@ -110,8 +143,66 @@ static uint64_t RateLimitRetryDelaySeconds(const duckdb_httplib_openssl::Respons
 	}
 	return MinValue<uint64_t>(uint64_t(1) << attempt, 60); // 1, 2, 4, 8, ... seconds
 }
+#endif
 
-string DatadogClient::SearchLogs(ClientContext &context, const string &request_body_json) const {
+string DatadogClient::AuthenticatedRequest(ClientContext &context, const string &path, const string *body,
+                                           bool index_discovery) const {
+#ifdef __EMSCRIPTEN__
+	if (context.interrupted) {
+		throw InterruptException();
+	}
+
+	const auto base_url = BuildBaseUrl(site);
+	const auto url = base_url + path;
+	auto &http_util = HTTPUtil::Get(*context.db);
+	auto params = http_util.InitializeParameters(context, url);
+	params->timeout = timeout_seconds;
+	params->retries = retries;
+	params->keep_alive = true;
+	params->follow_location = false;
+
+	HTTPHeaders headers;
+	headers.Insert("DD-API-KEY", api_key);
+	headers.Insert("DD-APPLICATION-KEY", app_key);
+	headers.Insert("Accept", "application/json");
+
+	unique_ptr<HTTPResponse> response;
+	if (body) {
+		headers.Insert("Content-Type", "application/json");
+		PostRequestInfo request(url, headers, *params, reinterpret_cast<const_data_ptr_t>(body->data()), body->size());
+		request.try_request = true;
+		response = http_util.Request(request);
+	} else {
+		GetRequestInfo request(url, headers, *params, nullptr, nullptr);
+		request.try_request = true;
+		response = http_util.Request(request);
+	}
+
+	if (!response) {
+		throw IOException("Datadog browser request failed through %s: no response (check the proxy URL and CORS "
+		                  "allowlist)",
+		                  base_url);
+	}
+	if (!response->Success()) {
+		auto status = static_cast<uint16_t>(response->status);
+		if (index_discovery && (status == 401 || status == 403)) {
+			throw IOException("Datadog index discovery returned HTTP %d through %s. Automatic discovery requires "
+			                  "logs_read_config; attach with INDEXES ['main', ...] to bypass discovery",
+			                  status, base_url);
+		}
+		if (response->status != HTTPStatusCode::INVALID) {
+			auto detail = BrowserHTTPErrorDetail(*response);
+			if (detail.empty()) {
+				detail = "request rejected without a response body";
+			}
+			throw IOException("Datadog API returned HTTP %d through %s: %s", status, base_url, detail);
+		}
+		throw IOException("Datadog browser request failed through %s: %s (check the proxy URL, CORS allowlist, "
+		                  "and network connection)",
+		                  base_url, response->GetError());
+	}
+	return response->body;
+#else
 	duckdb_httplib_openssl::Headers headers = {
 	    {"DD-API-KEY", api_key},
 	    {"DD-APPLICATION-KEY", app_key},
@@ -123,7 +214,7 @@ string DatadogClient::SearchLogs(ClientContext &context, const string &request_b
 			throw InterruptException();
 		}
 		auto response =
-		    GetConnection().Post("/api/v2/logs/events/search", headers, request_body_json, "application/json");
+		    body ? GetConnection().Post(path, headers, *body, "application/json") : GetConnection().Get(path, headers);
 
 		if (!response) {
 			auto error = response.error();
@@ -151,10 +242,24 @@ string DatadogClient::SearchLogs(ClientContext &context, const string &request_b
 			continue;
 		}
 		if (response->status < 200 || response->status >= 300) {
+			if (index_discovery && (response->status == 401 || response->status == 403)) {
+				throw IOException("Datadog index discovery returned HTTP %d. Automatic discovery requires the "
+				                  "logs_read_config permission; attach with INDEXES ['main', ...] to bypass discovery",
+				                  response->status);
+			}
 			throw IOException("Datadog API returned HTTP %d: %s", response->status, response->body);
 		}
 		return response->body;
 	}
+#endif
+}
+
+string DatadogClient::SearchLogs(ClientContext &context, const string &request_body_json) const {
+	return AuthenticatedRequest(context, "/api/v2/logs/events/search", &request_body_json, false);
+}
+
+string DatadogClient::ListLogIndexes(ClientContext &context) const {
+	return AuthenticatedRequest(context, "/api/v1/logs/config/indexes", nullptr, true);
 }
 
 } // namespace duckdb

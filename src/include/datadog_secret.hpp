@@ -8,6 +8,7 @@ class ExtensionLoader;
 
 //! Credentials needed to talk to the Datadog Logs API.
 struct DatadogCredentials {
+	string name;
 	string api_key;
 	string app_key;
 	string site = "datadoghq.com";

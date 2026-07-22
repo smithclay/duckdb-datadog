@@ -1,13 +1,20 @@
 #include "logs_table.hpp"
 
 #include "datadog_client.hpp"
+#include "datadog_json.hpp"
 #include "datadog_secret.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 
 #include "yyjson.hpp"
 
@@ -59,7 +66,7 @@ static constexpr idx_t COL_RESOURCE_ATTRS = 11;
 static constexpr idx_t COL_LOG_ATTRS = 15;
 static constexpr idx_t COLUMN_COUNT = 18;
 
-static void GetLogsSchema(vector<LogicalType> &types, vector<string> &names) {
+void GetDatadogLogsSchema(vector<LogicalType> &types, vector<string> &names) {
 	names = {"time_unix_nano",
 	         "observed_time_unix_nano",
 	         "trace_id",
@@ -189,33 +196,6 @@ static string BuildResourceAttributes(yyjson_val *attributes) {
 	return json ? string(json.get()) : string();
 }
 
-//! Build the POST body for /api/v2/logs/events/search.
-static string BuildSearchBody(const string &query, const string &from, const string &to, int64_t limit,
-                              const string &cursor) {
-	YyjsonMutDocPtr doc(yyjson_mut_doc_new(nullptr));
-	yyjson_mut_val *root = yyjson_mut_obj(doc.get());
-	yyjson_mut_doc_set_root(doc.get(), root);
-
-	yyjson_mut_val *filter = yyjson_mut_obj(doc.get());
-	yyjson_mut_obj_add_strcpy(doc.get(), filter, "query", query.c_str());
-	yyjson_mut_obj_add_strcpy(doc.get(), filter, "from", from.c_str());
-	yyjson_mut_obj_add_strcpy(doc.get(), filter, "to", to.c_str());
-	yyjson_mut_obj_add_val(doc.get(), root, "filter", filter);
-
-	// Ascending, stable sort so cursor pagination returns a deterministic ordering.
-	yyjson_mut_obj_add_strcpy(doc.get(), root, "sort", "timestamp");
-
-	yyjson_mut_val *page = yyjson_mut_obj(doc.get());
-	yyjson_mut_obj_add_int(doc.get(), page, "limit", limit);
-	if (!cursor.empty()) {
-		yyjson_mut_obj_add_strcpy(doc.get(), page, "cursor", cursor.c_str());
-	}
-	yyjson_mut_obj_add_val(doc.get(), root, "page", page);
-
-	YyjsonStrPtr json(yyjson_mut_write(doc.get(), 0, nullptr));
-	return json ? string(json.get()) : string();
-}
-
 //! Map one Datadog log event (`data[]` element) to the projected columns of a row.
 //! `column_ids[c]` is the source column for output slot c (projection pushdown); only projected
 //! columns are computed, so deselected fields — above all the log_attributes JSON serialization,
@@ -312,8 +292,12 @@ struct DatadogLogsBindData : public TableFunctionData {
 	string query = "*";
 	string from = "now-15m";
 	string to = "now";
+	string sort = "timestamp";
 	int64_t page_size = 1000; // rows per API request (Datadog max)
 	int64_t max_rows = 0;     // 0 = unlimited
+	vector<string> indexes;   // empty = search all indexes (existing table-function behavior)
+	DatadogFilterPushdown pushdown;
+	TableCatalogEntry *table = nullptr;
 	DatadogClient client;
 };
 
@@ -325,6 +309,13 @@ struct DatadogLogsGlobalState : public GlobalTableFunctionState {
 	std::deque<vector<Value>> buffer;
 	//! Next-page cursor from meta.page.after ("" = request the first page).
 	string cursor;
+	//! Effective request values after conservative WHERE pushdown is resolved.
+	string request_query;
+	string request_from;
+	string request_to;
+	//! Sum of requested page limits. Reserving the row budget when a request is sent
+	//! guarantees PAGE_SIZE >= MAX_ROWS cannot trigger another cursor request.
+	idx_t row_budget_used = 0;
 	idx_t total_emitted = 0;
 	bool finished = false;
 
@@ -332,6 +323,24 @@ struct DatadogLogsGlobalState : public GlobalTableFunctionState {
 		return 1; // Serialize: cursor pagination is inherently sequential.
 	}
 };
+
+void ValidateDatadogLogsSettings(const DatadogLogsSettings &settings, const string &error_prefix) {
+	if (settings.sort != "timestamp" && settings.sort != "-timestamp") {
+		throw InvalidInputException("%s: sort must be either 'timestamp' or '-timestamp'", error_prefix);
+	}
+	if (settings.page_size < 1 || settings.page_size > 1000) {
+		throw InvalidInputException("%s: page_size must be between 1 and 1000 (the Datadog API limit)", error_prefix);
+	}
+	if (settings.max_rows < 0) {
+		throw InvalidInputException("%s: max_rows must be >= 0 (0 means unlimited)", error_prefix);
+	}
+	if (settings.retries < 0) {
+		throw InvalidInputException("%s: retries must be >= 0 (0 disables retrying)", error_prefix);
+	}
+	if (settings.timeout_seconds < 1) {
+		throw InvalidInputException("%s: timeout must be >= 1 (seconds)", error_prefix);
+	}
+}
 
 //! Fetch the next page and update pagination state. Pure cursor pagination: follow
 //! meta.page.after until it is empty, a page returns no events, or the cursor stops advancing
@@ -341,8 +350,12 @@ struct DatadogLogsGlobalState : public GlobalTableFunctionState {
 //! exceed the API's cursor depth should be paged through by narrowing `from`/`to` at the call
 //! site (e.g. one hour at a time).
 static void FetchNextPage(ClientContext &context, const DatadogLogsBindData &bind, DatadogLogsGlobalState &state) {
-	string body = BuildSearchBody(bind.query, bind.from, bind.to, bind.page_size, state.cursor);
+	auto page_limit = GetDatadogLogsPageLimit(bind.page_size, bind.max_rows, state.row_budget_used);
+	D_ASSERT(page_limit > 0);
+	string body = BuildDatadogLogsSearchBody(state.request_query, state.request_from, state.request_to, bind.sort,
+	                                         page_limit, state.cursor, bind.indexes);
 	string response = bind.client.SearchLogs(context, body);
+	state.row_budget_used += static_cast<idx_t>(page_limit);
 
 	YyjsonDocPtr doc(yyjson_read(response.c_str(), response.size(), 0));
 	if (!doc) {
@@ -367,7 +380,8 @@ static void FetchNextPage(ClientContext &context, const DatadogLogsBindData &bin
 	yyjson_val *page = meta ? yyjson_obj_get(meta, "page") : nullptr;
 	const char *after = GetStr(page, "after");
 
-	if (!after || after[0] == '\0' || page_rows == 0 || state.cursor == after) {
+	if (GetDatadogLogsPageLimit(bind.page_size, bind.max_rows, state.row_budget_used) == 0 || !after ||
+	    after[0] == '\0' || page_rows == 0 || state.cursor == after) {
 		state.finished = true;
 	} else {
 		state.cursor = after; // copies the C-string before `doc` is freed at scope end
@@ -377,6 +391,7 @@ static void FetchNextPage(ClientContext &context, const DatadogLogsBindData &bin
 static unique_ptr<FunctionData> DatadogLogsBind(ClientContext &context, TableFunctionBindInput &input,
                                                 vector<LogicalType> &return_types, vector<string> &names) {
 	auto result = make_uniq<DatadogLogsBindData>();
+	DatadogLogsSettings settings;
 	string secret_name;
 
 	for (auto &param : input.named_parameters) {
@@ -390,47 +405,47 @@ static unique_ptr<FunctionData> DatadogLogsBind(ClientContext &context, TableFun
 			result->from = param.second.ToString();
 		} else if (key == "to") {
 			result->to = param.second.ToString();
+		} else if (key == "sort") {
+			settings.sort = param.second.ToString();
 		} else if (key == "page_size") {
-			result->page_size = param.second.GetValue<int64_t>();
+			settings.page_size = param.second.GetValue<int64_t>();
 		} else if (key == "max_rows") {
-			result->max_rows = param.second.GetValue<int64_t>();
+			settings.max_rows = param.second.GetValue<int64_t>();
 		} else if (key == "retries") {
-			auto retries = param.second.GetValue<int64_t>();
-			if (retries < 0) {
-				throw InvalidInputException("read_datadog_logs: retries must be >= 0 (0 disables retrying)");
-			}
-			result->client.retries = static_cast<uint64_t>(retries);
+			settings.retries = param.second.GetValue<int64_t>();
 		} else if (key == "timeout") {
-			auto timeout = param.second.GetValue<int64_t>();
-			if (timeout < 1) {
-				throw InvalidInputException("read_datadog_logs: timeout must be >= 1 (seconds)");
-			}
-			result->client.timeout_seconds = static_cast<uint64_t>(timeout);
+			settings.timeout_seconds = param.second.GetValue<int64_t>();
 		} else if (key == "secret") {
 			secret_name = param.second.ToString();
 		}
 	}
 
-	if (result->page_size < 1 || result->page_size > 1000) {
-		throw InvalidInputException("read_datadog_logs: page_size must be between 1 and 1000 (the Datadog API limit)");
-	}
-	if (result->max_rows < 0) {
-		throw InvalidInputException("read_datadog_logs: max_rows must be >= 0 (0 means unlimited)");
-	}
+	ValidateDatadogLogsSettings(settings, "read_datadog_logs");
+	result->sort = settings.sort;
+	result->page_size = settings.page_size;
+	result->max_rows = settings.max_rows;
+	result->client.retries = static_cast<uint64_t>(settings.retries);
+	result->client.timeout_seconds = static_cast<uint64_t>(settings.timeout_seconds);
 
 	auto credentials = GetDatadogCredentials(context, secret_name);
 	result->client.site = credentials.site;
 	result->client.api_key = credentials.api_key;
 	result->client.app_key = credentials.app_key;
 
-	GetLogsSchema(return_types, names);
+	GetDatadogLogsSchema(return_types, names);
 	return std::move(result);
 }
 
 static unique_ptr<GlobalTableFunctionState> DatadogLogsInitGlobal(ClientContext &context,
                                                                   TableFunctionInitInput &input) {
 	auto state = make_uniq<DatadogLogsGlobalState>();
+	auto &bind = input.bind_data->Cast<DatadogLogsBindData>();
 	state->column_ids = input.column_ids;
+	auto resolved = ResolveDatadogSearch(bind.query, bind.from, bind.to, bind.pushdown);
+	state->request_query = std::move(resolved.query);
+	state->request_from = std::move(resolved.from);
+	state->request_to = std::move(resolved.to);
+	state->finished = resolved.empty;
 	return std::move(state);
 }
 
@@ -438,7 +453,7 @@ static void DatadogLogsScan(ClientContext &context, TableFunctionInput &data_p, 
 	auto &bind = data_p.bind_data->Cast<DatadogLogsBindData>();
 	auto &state = data_p.global_state->Cast<DatadogLogsGlobalState>();
 
-	if (bind.max_rows > 0 && state.total_emitted >= static_cast<idx_t>(bind.max_rows)) {
+	if (DatadogLogsMaxRowsReached(bind.max_rows, state.total_emitted)) {
 		// Row cap already reached — stop before issuing another request.
 		state.finished = true;
 		state.buffer.clear();
@@ -451,7 +466,7 @@ static void DatadogLogsScan(ClientContext &context, TableFunctionInput &data_p, 
 
 	idx_t count = 0;
 	while (count < STANDARD_VECTOR_SIZE && !state.buffer.empty()) {
-		if (bind.max_rows > 0 && state.total_emitted >= static_cast<idx_t>(bind.max_rows)) {
+		if (DatadogLogsMaxRowsReached(bind.max_rows, state.total_emitted)) {
 			state.finished = true;
 			state.buffer.clear();
 			break;
@@ -463,9 +478,192 @@ static void DatadogLogsScan(ClientContext &context, TableFunctionInput &data_p, 
 		state.buffer.pop_front();
 		count++;
 		state.total_emitted++;
+		if (DatadogLogsMaxRowsReached(bind.max_rows, state.total_emitted)) {
+			state.finished = true;
+			state.buffer.clear();
+			break;
+		}
 	}
 
 	output.SetCardinality(count);
+}
+
+static bool IsSafeDatadogFacetValue(const string &value) {
+	if (value.empty()) {
+		return false;
+	}
+	for (idx_t i = 0; i < value.size(); i++) {
+		auto ch = value[i];
+		auto c = static_cast<unsigned char>(ch);
+		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.' ||
+		    (c == '-' && i > 0)) {
+			continue;
+		}
+		return false;
+	}
+	return true;
+}
+
+static ExpressionType ReverseComparison(ExpressionType type) {
+	switch (type) {
+	case ExpressionType::COMPARE_LESSTHAN:
+		return ExpressionType::COMPARE_GREATERTHAN;
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		return ExpressionType::COMPARE_GREATERTHANOREQUALTO;
+	case ExpressionType::COMPARE_GREATERTHAN:
+		return ExpressionType::COMPARE_LESSTHAN;
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		return ExpressionType::COMPARE_LESSTHANOREQUALTO;
+	default:
+		return type;
+	}
+}
+
+static int64_t FloorNanosecondsToMilliseconds(int64_t nanos) {
+	constexpr int64_t NANOS_PER_MILLISECOND = 1000 * 1000;
+	auto millis = nanos / NANOS_PER_MILLISECOND;
+	if (nanos % NANOS_PER_MILLISECOND < 0) {
+		millis--;
+	}
+	return millis;
+}
+
+static int64_t CeilNanosecondsToMilliseconds(int64_t nanos) {
+	constexpr int64_t NANOS_PER_MILLISECOND = 1000 * 1000;
+	auto millis = nanos / NANOS_PER_MILLISECOND;
+	if (nanos % NANOS_PER_MILLISECOND > 0) {
+		millis++;
+	}
+	return millis;
+}
+
+static void AddDatadogQueryTerm(DatadogFilterPushdown &pushdown, string term) {
+	for (const auto &existing : pushdown.query_terms) {
+		if (existing == term) {
+			return;
+		}
+	}
+	pushdown.query_terms.push_back(std::move(term));
+}
+
+static void TryPushDatadogComparison(const LogicalGet &get, const BoundComparisonExpression &comparison,
+                                     DatadogFilterPushdown &pushdown) {
+	const BoundColumnRefExpression *column = nullptr;
+	const BoundConstantExpression *constant = nullptr;
+	auto comparison_type = comparison.type;
+
+	if (comparison.left->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+	    comparison.right->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+		column = &comparison.left->Cast<BoundColumnRefExpression>();
+		constant = &comparison.right->Cast<BoundConstantExpression>();
+	} else if (comparison.right->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+	           comparison.left->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+		column = &comparison.right->Cast<BoundColumnRefExpression>();
+		constant = &comparison.left->Cast<BoundConstantExpression>();
+		comparison_type = ReverseComparison(comparison_type);
+	} else {
+		return;
+	}
+
+	const auto &column_ids = get.GetColumnIds();
+	if (column->depth != 0 || column->binding.table_index != get.table_index ||
+	    column->binding.column_index >= column_ids.size() || constant->value.IsNull()) {
+		return;
+	}
+
+	auto source_column = column_ids[column->binding.column_index].GetPrimaryIndex();
+	if (source_column >= get.names.size()) {
+		return;
+	}
+	const auto &column_name = get.names[source_column];
+	if ((column_name == "service_name" || column_name == "severity_text") &&
+	    comparison_type == ExpressionType::COMPARE_EQUAL && constant->value.type().id() == LogicalTypeId::VARCHAR) {
+		auto value = constant->value.GetValue<string>();
+		if (!IsSafeDatadogFacetValue(value)) {
+			return;
+		}
+		AddDatadogQueryTerm(pushdown, (column_name == "service_name" ? "service:" : "status:") + value);
+		return;
+	}
+
+	if (column_name != "time_unix_nano" || constant->value.type().id() != LogicalTypeId::TIMESTAMP_NS) {
+		return;
+	}
+	auto nanos = constant->value.GetValue<timestamp_ns_t>().value;
+	switch (comparison_type) {
+	case ExpressionType::COMPARE_GREATERTHAN:
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO: {
+		auto millis = FloorNanosecondsToMilliseconds(nanos);
+		if (!pushdown.has_lower_bound_ms || millis > pushdown.lower_bound_ms) {
+			pushdown.has_lower_bound_ms = true;
+			pushdown.lower_bound_ms = millis;
+		}
+		break;
+	}
+	case ExpressionType::COMPARE_LESSTHAN:
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO: {
+		auto millis = CeilNanosecondsToMilliseconds(nanos);
+		if (!pushdown.has_upper_bound_ms || millis < pushdown.upper_bound_ms) {
+			pushdown.has_upper_bound_ms = true;
+			pushdown.upper_bound_ms = millis;
+		}
+		break;
+	}
+	default:
+		break;
+	}
+}
+
+static void TryPushDatadogExpression(const LogicalGet &get, const Expression &expression,
+                                     DatadogFilterPushdown &pushdown) {
+	if (expression.GetExpressionClass() == ExpressionClass::BOUND_COMPARISON) {
+		TryPushDatadogComparison(get, expression.Cast<BoundComparisonExpression>(), pushdown);
+		return;
+	}
+	if (expression.GetExpressionClass() != ExpressionClass::BOUND_CONJUNCTION ||
+	    expression.type != ExpressionType::CONJUNCTION_AND) {
+		return;
+	}
+	for (const auto &child : expression.Cast<BoundConjunctionExpression>().children) {
+		TryPushDatadogExpression(get, *child, pushdown);
+	}
+}
+
+static void DatadogLogsPushdownComplexFilter(ClientContext &, LogicalGet &get, FunctionData *bind_data,
+                                             vector<unique_ptr<Expression>> &filters) {
+	auto &bind = bind_data->Cast<DatadogLogsBindData>();
+	bind.pushdown = DatadogFilterPushdown();
+	// max_rows caps the unfiltered table-function input. Moving a WHERE predicate below that cap
+	// changes which rows participate, so no remote filters are valid for a capped scan.
+	if (bind.max_rows > 0) {
+		return;
+	}
+	for (const auto &filter : filters) {
+		TryPushDatadogExpression(get, *filter, bind.pushdown);
+	}
+	// Deliberately leave every expression in `filters`. DuckDB retains a residual
+	// filter above the scan, guaranteeing exact SQL semantics even if Datadog's
+	// search behavior or timestamp precision is broader than DuckDB's.
+}
+
+static InsertionOrderPreservingMap<string> DatadogLogsToString(TableFunctionToStringInput &input) {
+	InsertionOrderPreservingMap<string> result;
+	auto &bind = input.bind_data->Cast<DatadogLogsBindData>();
+	auto resolved = ResolveDatadogSearch(bind.query, bind.from, bind.to, bind.pushdown);
+	result["Function"] = input.table_function.name;
+	result["Datadog Query"] = resolved.query;
+	result["Datadog Sort"] = bind.sort;
+	result["Datadog Page Size"] = std::to_string(bind.page_size);
+	result["Datadog Max Rows"] = std::to_string(bind.max_rows);
+	result["Datadog Retries"] = std::to_string(bind.client.retries);
+	result["Datadog Timeout"] = std::to_string(bind.client.timeout_seconds);
+	if (resolved.from != bind.from) {
+		result["Datadog From"] = resolved.from;
+	}
+	if (resolved.to != bind.to) {
+		result["Datadog To"] = resolved.to;
+	}
+	return result;
 }
 
 void RegisterDatadogLogsFunction(ExtensionLoader &loader) {
@@ -473,6 +671,7 @@ void RegisterDatadogLogsFunction(ExtensionLoader &loader) {
 	function.named_parameters["query"] = LogicalType::VARCHAR;
 	function.named_parameters["from"] = LogicalType::VARCHAR;
 	function.named_parameters["to"] = LogicalType::VARCHAR;
+	function.named_parameters["sort"] = LogicalType::VARCHAR;
 	function.named_parameters["page_size"] = LogicalType::BIGINT;
 	function.named_parameters["max_rows"] = LogicalType::BIGINT;
 	function.named_parameters["retries"] = LogicalType::BIGINT;
@@ -482,7 +681,42 @@ void RegisterDatadogLogsFunction(ExtensionLoader &loader) {
 	// (the search API has no response field selection), but e.g. a count(*) or a GROUP BY
 	// service_name never pays the per-row log_attributes JSON serialization.
 	function.projection_pushdown = true;
+	function.pushdown_complex_filter = DatadogLogsPushdownComplexFilter;
+	function.filter_pushdown = false; // translated predicates always remain as DuckDB residual filters
+	function.to_string = DatadogLogsToString;
 	loader.RegisterFunction(function);
+}
+
+static BindInfo DatadogLogsGetBindInfo(const optional_ptr<FunctionData> bind_data) {
+	auto &data = bind_data->Cast<DatadogLogsBindData>();
+	D_ASSERT(data.table);
+	return BindInfo(*data.table);
+}
+
+TableFunction GetDatadogLogsTableScan(ClientContext &context, TableCatalogEntry &table, const string &secret_name,
+                                      const string &index_name, const DatadogLogsSettings &settings,
+                                      unique_ptr<FunctionData> &bind_data) {
+	auto result = make_uniq<DatadogLogsBindData>();
+	result->indexes.push_back(index_name);
+	result->table = &table;
+	result->sort = settings.sort;
+	result->page_size = settings.page_size;
+	result->max_rows = settings.max_rows;
+	result->client.retries = static_cast<uint64_t>(settings.retries);
+	result->client.timeout_seconds = static_cast<uint64_t>(settings.timeout_seconds);
+	auto credentials = GetDatadogCredentials(context, secret_name);
+	result->client.site = credentials.site;
+	result->client.api_key = credentials.api_key;
+	result->client.app_key = credentials.app_key;
+	bind_data = std::move(result);
+
+	TableFunction function("datadog_logs_scan", {}, DatadogLogsScan, nullptr, DatadogLogsInitGlobal);
+	function.projection_pushdown = true;
+	function.pushdown_complex_filter = DatadogLogsPushdownComplexFilter;
+	function.filter_pushdown = false; // translated predicates always remain as DuckDB residual filters
+	function.to_string = DatadogLogsToString;
+	function.get_bind_info = DatadogLogsGetBindInfo;
+	return function;
 }
 
 } // namespace duckdb

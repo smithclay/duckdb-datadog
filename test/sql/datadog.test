@@ -22,6 +22,13 @@ SELECT * FROM read_datadog_logs(query => '*', "from" => 'now-15m', "to" => 'now'
 ----
 No 'datadog' secret found
 
+# Catalog attachment validates credentials before doing anything else. Explicit INDEXES keeps
+# this path offline while preserving the same helpful missing-secret error.
+statement error
+ATTACH 'datadog:' AS dd_missing (TYPE datadog, INDEXES ['main']);
+----
+No 'datadog' secret found
+
 # The custom secret type works.
 statement ok
 CREATE SECRET dd_test (
@@ -84,8 +91,244 @@ SELECT * FROM read_datadog_logs(timeout => 0);
 ----
 timeout must be >= 1
 
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM read_datadog_logs(sort => '-timestamp');
+----
+physical_plan	<REGEX>:.*"Datadog Sort": "-timestamp".*
+
+# Existing table-function defaults remain unchanged, including ascending sort and unlimited rows.
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM read_datadog_logs();
+----
+physical_plan	<REGEX>:.*"Datadog Sort": "timestamp".*"Datadog Page Size": "1000".*"Datadog Max Rows": "0".*"Datadog Retries": "4".*"Datadog Timeout": "60".*
+
+statement error
+SELECT * FROM read_datadog_logs(sort => 'newest');
+----
+sort must be either 'timestamp' or '-timestamp'
+
 # The old page-size parameter name is gone (renamed to page_size before any release).
 statement error
 SELECT * FROM read_datadog_logs("limit" => 10);
 ----
 Invalid named parameter
+
+# Explicit indexes bypass network discovery entirely. Duplicate names are removed in input order.
+statement ok
+ATTACH 'datadog:' AS dd (
+    TYPE datadog,
+    SECRET 'dd_test',
+    INDEXES ['main', 'security-events', 'main']
+);
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'dd' AND schema_name = 'logs';
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dd' AND schema_name = 'logs';
+----
+2
+
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name = 'dd' AND schema_name = 'logs' AND table_name = 'main';
+----
+1
+
+query I rowsort
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'dd' AND schema_name = 'logs';
+----
+main
+security-events
+
+# Catalog tables and the stable table function expose exactly the same 18 columns and types.
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM dd.logs.main);
+----
+18
+
+# Supported WHERE predicates bind through the catalog without executing a network request.
+# They are translated conservatively and remain as DuckDB residual filters.
+statement ok
+EXPLAIN SELECT body FROM dd.logs.main
+WHERE service_name = 'edge'
+  AND severity_text = 'error'
+  AND time_unix_nano >= TIMESTAMP_NS '2026-01-01 00:00:00';
+
+# max_rows caps the table function before SQL WHERE evaluation, so remote pushdown must be
+# disabled or it would change which rows participate in the cap.
+query II
+EXPLAIN (FORMAT JSON)
+SELECT body FROM read_datadog_logs(max_rows => 1) WHERE service_name = 'edge';
+----
+physical_plan	<REGEX>:.*"Datadog Query": "[*]".*
+
+# Unsupported shapes remain ordinary local DuckDB filters.
+statement ok
+EXPLAIN SELECT body FROM dd.logs.main
+WHERE body LIKE '%timeout%' OR severity_number >= 17;
+
+query I
+SELECT count(*)
+FROM (
+    (SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM dd.logs.main))
+    EXCEPT ALL
+    (SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_datadog_logs()))
+);
+----
+0
+
+# Datadog index names are preserved and names requiring quoting bind normally.
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM dd.logs."security-events");
+----
+18
+
+# Bounded catalog settings are retained in table metadata and copied into scan bind data.
+statement ok
+ATTACH 'datadog:' AS dd_bounded (
+    TYPE datadog,
+    SECRET 'dd_test',
+    INDEXES ['main'],
+    SORT '-timestamp',
+    PAGE_SIZE 100,
+    MAX_ROWS 100,
+    RETRIES 0,
+    TIMEOUT 15
+);
+
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM dd_bounded.logs.main;
+----
+physical_plan	<REGEX>:.*"Datadog Sort": "-timestamp".*"Datadog Page Size": "100".*"Datadog Max Rows": "100".*"Datadog Retries": "0".*"Datadog Timeout": "15".*
+
+# MAX_ROWS caps the source relation before SQL WHERE evaluation, including for catalog scans.
+# The remote query must therefore remain '*' and DuckDB retains the residual filter.
+query II
+EXPLAIN (FORMAT JSON) SELECT body FROM dd_bounded.logs.main WHERE service_name = 'edge';
+----
+physical_plan	<REGEX>:.*"Datadog Query": "[*]".*
+
+statement ok
+DETACH dd_bounded;
+
+# All bounded ATTACH options reject invalid values before a catalog is created.
+statement error
+ATTACH 'datadog:' AS dd_bad_sort (TYPE datadog, SECRET 'dd_test', INDEXES ['main'], SORT 'newest');
+----
+sort must be either 'timestamp' or '-timestamp'
+
+statement error
+ATTACH 'datadog:' AS dd_bad_page_zero (TYPE datadog, SECRET 'dd_test', INDEXES ['main'], PAGE_SIZE 0);
+----
+page_size must be between 1 and 1000
+
+statement error
+ATTACH 'datadog:' AS dd_bad_page_large (TYPE datadog, SECRET 'dd_test', INDEXES ['main'], PAGE_SIZE 1001);
+----
+page_size must be between 1 and 1000
+
+statement error
+ATTACH 'datadog:' AS dd_bad_max_rows (TYPE datadog, SECRET 'dd_test', INDEXES ['main'], MAX_ROWS -1);
+----
+max_rows must be >= 0
+
+statement error
+ATTACH 'datadog:' AS dd_bad_retries (TYPE datadog, SECRET 'dd_test', INDEXES ['main'], RETRIES -1);
+----
+retries must be >= 0
+
+statement error
+ATTACH 'datadog:' AS dd_bad_timeout (TYPE datadog, SECRET 'dd_test', INDEXES ['main'], TIMEOUT 0);
+----
+timeout must be >= 1
+
+# Explicit names must be non-null and non-empty.
+statement error
+ATTACH 'datadog:' AS dd_null (TYPE datadog, SECRET 'dd_test', INDEXES ['main', NULL]);
+----
+INDEXES must contain only non-null VARCHAR names
+
+statement error
+ATTACH 'datadog:' AS dd_empty (TYPE datadog, SECRET 'dd_test', INDEXES ['']);
+----
+INDEXES must not contain empty index names
+
+# Unknown storage options fail at attach time with a useful allow-list.
+statement error
+ATTACH 'datadog:' AS dd_bad_option (TYPE datadog, SECRET 'dd_test', INDEXES ['main'], FOO 'bar');
+----
+Unsupported Datadog ATTACH option 'foo'
+
+# The attached catalog is genuinely read-only across DDL and DML paths.
+statement error
+CREATE TABLE dd.logs.nope(i INTEGER);
+----
+read-only
+
+statement error
+DROP TABLE dd.logs.main;
+----
+read-only
+
+statement error
+ALTER TABLE dd.logs.main RENAME TO renamed;
+----
+read-only
+
+statement error
+INSERT INTO dd.logs.main (body) VALUES ('not allowed');
+----
+read-only
+
+statement error
+UPDATE dd.logs.main SET body = 'not allowed';
+----
+read-only
+
+statement error
+DELETE FROM dd.logs.main;
+----
+read-only
+
+statement ok
+DETACH dd;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dd';
+----
+0
+
+# Omitting SECRET uses the same first in-scope Datadog secret selection as the table function.
+statement ok
+ATTACH 'datadog:' AS dd_default (TYPE datadog, INDEXES ['main']);
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dd_default' AND table_name = 'main';
+----
+1
+
+# The implicit selection is pinned at ATTACH. Replacing the available secrets must not silently
+# redirect this catalog to another Datadog account.
+statement ok
+CREATE SECRET dd_other (
+    TYPE datadog,
+    API_KEY 'OTHER_API_KEY_VALUE',
+    APP_KEY 'OTHER_APP_KEY_VALUE'
+);
+
+statement ok
+DROP SECRET dd_test;
+
+statement error
+DESCRIBE SELECT * FROM dd_default.logs.main;
+----
+No secret with name 'dd_test' found
+
+statement ok
+DETACH dd_default;
+
+statement ok
+DROP SECRET dd_other;

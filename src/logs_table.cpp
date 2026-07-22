@@ -292,6 +292,7 @@ struct DatadogLogsBindData : public TableFunctionData {
 	string query = "*";
 	string from = "now-15m";
 	string to = "now";
+	string sort = "timestamp";
 	int64_t page_size = 1000; // rows per API request (Datadog max)
 	int64_t max_rows = 0;     // 0 = unlimited
 	vector<string> indexes;   // empty = search all indexes (existing table-function behavior)
@@ -312,6 +313,9 @@ struct DatadogLogsGlobalState : public GlobalTableFunctionState {
 	string request_query;
 	string request_from;
 	string request_to;
+	//! Sum of requested page limits. Reserving the row budget when a request is sent
+	//! guarantees PAGE_SIZE >= MAX_ROWS cannot trigger another cursor request.
+	idx_t row_budget_used = 0;
 	idx_t total_emitted = 0;
 	bool finished = false;
 
@@ -319,6 +323,24 @@ struct DatadogLogsGlobalState : public GlobalTableFunctionState {
 		return 1; // Serialize: cursor pagination is inherently sequential.
 	}
 };
+
+void ValidateDatadogLogsSettings(const DatadogLogsSettings &settings, const string &error_prefix) {
+	if (settings.sort != "timestamp" && settings.sort != "-timestamp") {
+		throw InvalidInputException("%s: sort must be either 'timestamp' or '-timestamp'", error_prefix);
+	}
+	if (settings.page_size < 1 || settings.page_size > 1000) {
+		throw InvalidInputException("%s: page_size must be between 1 and 1000 (the Datadog API limit)", error_prefix);
+	}
+	if (settings.max_rows < 0) {
+		throw InvalidInputException("%s: max_rows must be >= 0 (0 means unlimited)", error_prefix);
+	}
+	if (settings.retries < 0) {
+		throw InvalidInputException("%s: retries must be >= 0 (0 disables retrying)", error_prefix);
+	}
+	if (settings.timeout_seconds < 1) {
+		throw InvalidInputException("%s: timeout must be >= 1 (seconds)", error_prefix);
+	}
+}
 
 //! Fetch the next page and update pagination state. Pure cursor pagination: follow
 //! meta.page.after until it is empty, a page returns no events, or the cursor stops advancing
@@ -328,9 +350,12 @@ struct DatadogLogsGlobalState : public GlobalTableFunctionState {
 //! exceed the API's cursor depth should be paged through by narrowing `from`/`to` at the call
 //! site (e.g. one hour at a time).
 static void FetchNextPage(ClientContext &context, const DatadogLogsBindData &bind, DatadogLogsGlobalState &state) {
-	string body = BuildDatadogLogsSearchBody(state.request_query, state.request_from, state.request_to, bind.page_size,
-	                                         state.cursor, bind.indexes);
+	auto page_limit = GetDatadogLogsPageLimit(bind.page_size, bind.max_rows, state.row_budget_used);
+	D_ASSERT(page_limit > 0);
+	string body = BuildDatadogLogsSearchBody(state.request_query, state.request_from, state.request_to, bind.sort,
+	                                         page_limit, state.cursor, bind.indexes);
 	string response = bind.client.SearchLogs(context, body);
+	state.row_budget_used += static_cast<idx_t>(page_limit);
 
 	YyjsonDocPtr doc(yyjson_read(response.c_str(), response.size(), 0));
 	if (!doc) {
@@ -355,7 +380,8 @@ static void FetchNextPage(ClientContext &context, const DatadogLogsBindData &bin
 	yyjson_val *page = meta ? yyjson_obj_get(meta, "page") : nullptr;
 	const char *after = GetStr(page, "after");
 
-	if (!after || after[0] == '\0' || page_rows == 0 || state.cursor == after) {
+	if (GetDatadogLogsPageLimit(bind.page_size, bind.max_rows, state.row_budget_used) == 0 || !after ||
+	    after[0] == '\0' || page_rows == 0 || state.cursor == after) {
 		state.finished = true;
 	} else {
 		state.cursor = after; // copies the C-string before `doc` is freed at scope end
@@ -365,6 +391,7 @@ static void FetchNextPage(ClientContext &context, const DatadogLogsBindData &bin
 static unique_ptr<FunctionData> DatadogLogsBind(ClientContext &context, TableFunctionBindInput &input,
                                                 vector<LogicalType> &return_types, vector<string> &names) {
 	auto result = make_uniq<DatadogLogsBindData>();
+	DatadogLogsSettings settings;
 	string secret_name;
 
 	for (auto &param : input.named_parameters) {
@@ -378,33 +405,27 @@ static unique_ptr<FunctionData> DatadogLogsBind(ClientContext &context, TableFun
 			result->from = param.second.ToString();
 		} else if (key == "to") {
 			result->to = param.second.ToString();
+		} else if (key == "sort") {
+			settings.sort = param.second.ToString();
 		} else if (key == "page_size") {
-			result->page_size = param.second.GetValue<int64_t>();
+			settings.page_size = param.second.GetValue<int64_t>();
 		} else if (key == "max_rows") {
-			result->max_rows = param.second.GetValue<int64_t>();
+			settings.max_rows = param.second.GetValue<int64_t>();
 		} else if (key == "retries") {
-			auto retries = param.second.GetValue<int64_t>();
-			if (retries < 0) {
-				throw InvalidInputException("read_datadog_logs: retries must be >= 0 (0 disables retrying)");
-			}
-			result->client.retries = static_cast<uint64_t>(retries);
+			settings.retries = param.second.GetValue<int64_t>();
 		} else if (key == "timeout") {
-			auto timeout = param.second.GetValue<int64_t>();
-			if (timeout < 1) {
-				throw InvalidInputException("read_datadog_logs: timeout must be >= 1 (seconds)");
-			}
-			result->client.timeout_seconds = static_cast<uint64_t>(timeout);
+			settings.timeout_seconds = param.second.GetValue<int64_t>();
 		} else if (key == "secret") {
 			secret_name = param.second.ToString();
 		}
 	}
 
-	if (result->page_size < 1 || result->page_size > 1000) {
-		throw InvalidInputException("read_datadog_logs: page_size must be between 1 and 1000 (the Datadog API limit)");
-	}
-	if (result->max_rows < 0) {
-		throw InvalidInputException("read_datadog_logs: max_rows must be >= 0 (0 means unlimited)");
-	}
+	ValidateDatadogLogsSettings(settings, "read_datadog_logs");
+	result->sort = settings.sort;
+	result->page_size = settings.page_size;
+	result->max_rows = settings.max_rows;
+	result->client.retries = static_cast<uint64_t>(settings.retries);
+	result->client.timeout_seconds = static_cast<uint64_t>(settings.timeout_seconds);
 
 	auto credentials = GetDatadogCredentials(context, secret_name);
 	result->client.site = credentials.site;
@@ -432,7 +453,7 @@ static void DatadogLogsScan(ClientContext &context, TableFunctionInput &data_p, 
 	auto &bind = data_p.bind_data->Cast<DatadogLogsBindData>();
 	auto &state = data_p.global_state->Cast<DatadogLogsGlobalState>();
 
-	if (bind.max_rows > 0 && state.total_emitted >= static_cast<idx_t>(bind.max_rows)) {
+	if (DatadogLogsMaxRowsReached(bind.max_rows, state.total_emitted)) {
 		// Row cap already reached — stop before issuing another request.
 		state.finished = true;
 		state.buffer.clear();
@@ -445,7 +466,7 @@ static void DatadogLogsScan(ClientContext &context, TableFunctionInput &data_p, 
 
 	idx_t count = 0;
 	while (count < STANDARD_VECTOR_SIZE && !state.buffer.empty()) {
-		if (bind.max_rows > 0 && state.total_emitted >= static_cast<idx_t>(bind.max_rows)) {
+		if (DatadogLogsMaxRowsReached(bind.max_rows, state.total_emitted)) {
 			state.finished = true;
 			state.buffer.clear();
 			break;
@@ -457,6 +478,11 @@ static void DatadogLogsScan(ClientContext &context, TableFunctionInput &data_p, 
 		state.buffer.pop_front();
 		count++;
 		state.total_emitted++;
+		if (DatadogLogsMaxRowsReached(bind.max_rows, state.total_emitted)) {
+			state.finished = true;
+			state.buffer.clear();
+			break;
+		}
 	}
 
 	output.SetCardinality(count);
@@ -626,6 +652,11 @@ static InsertionOrderPreservingMap<string> DatadogLogsToString(TableFunctionToSt
 	auto resolved = ResolveDatadogSearch(bind.query, bind.from, bind.to, bind.pushdown);
 	result["Function"] = input.table_function.name;
 	result["Datadog Query"] = resolved.query;
+	result["Datadog Sort"] = bind.sort;
+	result["Datadog Page Size"] = std::to_string(bind.page_size);
+	result["Datadog Max Rows"] = std::to_string(bind.max_rows);
+	result["Datadog Retries"] = std::to_string(bind.client.retries);
+	result["Datadog Timeout"] = std::to_string(bind.client.timeout_seconds);
 	if (resolved.from != bind.from) {
 		result["Datadog From"] = resolved.from;
 	}
@@ -640,6 +671,7 @@ void RegisterDatadogLogsFunction(ExtensionLoader &loader) {
 	function.named_parameters["query"] = LogicalType::VARCHAR;
 	function.named_parameters["from"] = LogicalType::VARCHAR;
 	function.named_parameters["to"] = LogicalType::VARCHAR;
+	function.named_parameters["sort"] = LogicalType::VARCHAR;
 	function.named_parameters["page_size"] = LogicalType::BIGINT;
 	function.named_parameters["max_rows"] = LogicalType::BIGINT;
 	function.named_parameters["retries"] = LogicalType::BIGINT;
@@ -662,10 +694,16 @@ static BindInfo DatadogLogsGetBindInfo(const optional_ptr<FunctionData> bind_dat
 }
 
 TableFunction GetDatadogLogsTableScan(ClientContext &context, TableCatalogEntry &table, const string &secret_name,
-                                      const string &index_name, unique_ptr<FunctionData> &bind_data) {
+                                      const string &index_name, const DatadogLogsSettings &settings,
+                                      unique_ptr<FunctionData> &bind_data) {
 	auto result = make_uniq<DatadogLogsBindData>();
 	result->indexes.push_back(index_name);
 	result->table = &table;
+	result->sort = settings.sort;
+	result->page_size = settings.page_size;
+	result->max_rows = settings.max_rows;
+	result->client.retries = static_cast<uint64_t>(settings.retries);
+	result->client.timeout_seconds = static_cast<uint64_t>(settings.timeout_seconds);
 	auto credentials = GetDatadogCredentials(context, secret_name);
 	result->client.site = credentials.site;
 	result->client.api_key = credentials.api_key;

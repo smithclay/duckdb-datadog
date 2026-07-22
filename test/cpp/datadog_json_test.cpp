@@ -28,14 +28,31 @@ int main() {
 		}
 		Require(malformed_rejected, "malformed discovered index names should be rejected");
 
-		auto bound = BuildDatadogLogsSearchBody("*", "now-15m", "now", 1000, "", {"main"});
+		auto bound = BuildDatadogLogsSearchBody("*", "now-15m", "now", "timestamp", 1000, "", {"main"});
 		Require(bound.find("\"indexes\":[\"main\"]") != string::npos,
 		        "catalog search body should contain exactly its bound index");
 		Require(bound.find("security-events") == string::npos, "catalog search body should not contain another index");
+		Require(bound.find("\"sort\":\"timestamp\"") != string::npos,
+		        "default search body should sort by ascending timestamp");
 
-		auto all = BuildDatadogLogsSearchBody("*", "now-15m", "now", 1000, "");
+		auto all = BuildDatadogLogsSearchBody("*", "now-15m", "now", "timestamp", 1000, "");
 		Require(all.find("\"indexes\"") == string::npos,
 		        "table-function search body should omit indexes when none are bound");
+
+		auto latest = BuildDatadogLogsSearchBody("*", "now-15m", "now", "-timestamp", 100, "", {"main"});
+		Require(
+		    latest ==
+		        R"({"filter":{"query":"*","from":"now-15m","to":"now","indexes":["main"]},"sort":"-timestamp","page":{"limit":100}})",
+		    "bounded latest-log request should use descending sort, limit 100, and no cursor");
+		Require(GetDatadogLogsPageLimit(1000, 100, 0) == 100,
+		        "max_rows smaller than page_size should reduce the first request limit");
+		Require(GetDatadogLogsPageLimit(100, 150, 100) == 50,
+		        "later requests should be limited to the remaining max_rows budget");
+		Require(GetDatadogLogsPageLimit(1000, 0, 5000) == 1000,
+		        "unlimited scans should retain the configured page size");
+		Require(DatadogLogsMaxRowsReached(100, 100), "a capped scan should stop before requesting another cursor page");
+		Require(GetDatadogLogsPageLimit(100, 100, 100) == 0,
+		        "the first request should reserve the full cap and prevent another cursor request");
 
 		DatadogFilterPushdown pushed;
 		pushed.query_terms = {"service:edge", "status:error"};
@@ -54,7 +71,8 @@ int main() {
 		Require(resolved.from == "now-15m" && resolved.to == "now",
 		        "timestamp predicates must preserve server-relative request bounds");
 		Require(!resolved.empty, "relative request bounds must not be declared empty using the client clock");
-		auto pushed_body = BuildDatadogLogsSearchBody(resolved.query, resolved.from, resolved.to, 1000, "", {"main"});
+		auto pushed_body =
+		    BuildDatadogLogsSearchBody(resolved.query, resolved.from, resolved.to, "timestamp", 1000, "", {"main"});
 		Require(pushed_body.find("\"query\":\"service:edge AND status:error\"") != string::npos,
 		        "search request should contain translated service and status predicates");
 		Require(pushed_body.find("\"from\":\"now-15m\"") != string::npos &&

@@ -1,5 +1,7 @@
 #include "datadog_client.hpp"
 
+#include "datadog_json.hpp"
+
 #include "duckdb/common/exception.hpp"
 #ifdef __EMSCRIPTEN__
 #include "duckdb/common/http_util.hpp"
@@ -256,6 +258,11 @@ string DatadogClient::AuthenticatedRequest(ClientContext &context, const string 
 
 string DatadogClient::SearchLogs(ClientContext &context, const string &request_body_json) const {
 	return AuthenticatedRequest(context, "/api/v2/logs/events/search", &request_body_json, false);
+}
+
+string DatadogClient::SearchOpenAlerts(ClientContext &context, int64_t page, int64_t per_page) const {
+	auto path = BuildDatadogOpenAlertsPath(page, per_page);
+	return AuthenticatedRequest(context, path, nullptr, false);
 }
 
 string DatadogClient::ListLogIndexes(ClientContext &context) const {

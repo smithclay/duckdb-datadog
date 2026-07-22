@@ -126,6 +126,41 @@ SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'dd' AND schema_name
 ----
 1
 
+# Open alerts are exposed as triggered monitor groups, matching Datadog's Triggered Monitors page.
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'dd' AND schema_name = 'alerts';
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name = 'dd' AND schema_name = 'alerts' AND table_name = 'open';
+----
+1
+
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM dd.alerts.open);
+----
+7
+
+query I rowsort
+SELECT column_name || ':' || column_type
+FROM (DESCRIBE SELECT * FROM dd.alerts.open);
+----
+group_name:VARCHAR
+group_tags:VARCHAR[]
+last_nodata_at:TIMESTAMP
+last_triggered_at:TIMESTAMP
+monitor_id:BIGINT
+monitor_name:VARCHAR
+status:VARCHAR
+
+# Binding and planning the table is network-free; the monitor API is called only when scanned.
+query II
+EXPLAIN (FORMAT JSON) SELECT monitor_id, status FROM dd.alerts.open;
+----
+physical_plan	<REGEX>:.*"Datadog Alert States": "Alert, Warn, No Data".*"Datadog Page Size": "100".*
+
 query I
 SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dd' AND schema_name = 'logs';
 ----
@@ -204,6 +239,11 @@ EXPLAIN (FORMAT JSON) SELECT * FROM dd_bounded.logs.main;
 ----
 physical_plan	<REGEX>:.*"Datadog Sort": "-timestamp".*"Datadog Page Size": "100".*"Datadog Max Rows": "100".*"Datadog Retries": "0".*"Datadog Timeout": "15".*
 
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM dd_bounded.alerts.open;
+----
+physical_plan	<REGEX>:.*"Datadog Alert States": "Alert, Warn, No Data".*"Datadog Retries": "0".*"Datadog Timeout": "15".*
+
 # MAX_ROWS caps the source relation before SQL WHERE evaluation, including for catalog scans.
 # The remote query must therefore remain '*' and DuckDB retains the residual filter.
 query II
@@ -265,6 +305,11 @@ Unsupported Datadog ATTACH option 'foo'
 # The attached catalog is genuinely read-only across DDL and DML paths.
 statement error
 CREATE TABLE dd.logs.nope(i INTEGER);
+----
+read-only
+
+statement error
+DROP TABLE dd.alerts.open;
 ----
 read-only
 

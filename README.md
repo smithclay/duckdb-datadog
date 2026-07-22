@@ -181,8 +181,8 @@ Because attribute columns are JSON strings, query them with DuckDB's JSON functi
 
 ## Building
 
-Dependencies are minimal: only OpenSSL (via vcpkg). HTTP (cpp-httplib) and JSON (yyjson) reuse the
-copies DuckDB already bundles, so nothing extra is pulled in.
+Native dependencies are minimal: only OpenSSL (via vcpkg). HTTP (cpp-httplib) and JSON (yyjson)
+reuse the copies DuckDB already bundles, so nothing extra is pulled in.
 
 ```shell
 # vcpkg provides OpenSSL
@@ -197,6 +197,18 @@ make test       # runs the offline SQL tests in test/sql/
 Built artifacts:
 - `./build/release/duckdb` — DuckDB shell with the extension preloaded.
 - `./build/release/extension/datadog/datadog.duckdb_extension` — the loadable binary.
+
+For DuckDB-WASM, source an Emscripten SDK compatible with the target DuckDB-WASM runtime and build
+the same checkout directly:
+
+```shell
+make wasm_eh
+```
+
+Emscripten builds use DuckDB's browser-backed HTTP transport and do not link OpenSSL or native
+sockets. In a browser build, `SITE` may also be a full `http://` or `https://` URL pointing at a
+same-origin CORS proxy; ordinary Datadog site names keep the `https://api.<site>` behavior used by
+native builds.
 
 ## Testing
 

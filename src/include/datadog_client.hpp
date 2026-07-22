@@ -2,11 +2,13 @@
 
 #include "duckdb.hpp"
 
-//! Forward-declared so the (large) httplib header stays out of this public header. The namespace
-//! name matches cpp-httplib's OpenSSL build, which CMake selects globally via CPPHTTPLIB_OPENSSL_SUPPORT.
+#ifndef __EMSCRIPTEN__
+//! Forward-declared so the native-only httplib header stays out of this public header. The
+//! namespace name matches cpp-httplib's OpenSSL build selected by CMake.
 namespace duckdb_httplib_openssl {
 class Client;
 }
+#endif
 
 namespace duckdb {
 class ClientContext;
@@ -16,7 +18,7 @@ class ClientContext;
 //! mapping live outside the client. A single keep-alive connection is reused across calls.
 struct DatadogClient {
 	//! Datadog site, e.g. "datadoghq.com", "datadoghq.eu", "us5.datadoghq.com". Requests go to
-	//! https://api.<site>.
+	//! https://api.<site>. Browser builds additionally accept a full URL for a same-origin proxy.
 	string site = "datadoghq.com";
 	string api_key;
 	string app_key;
@@ -51,6 +53,7 @@ struct DatadogClient {
 	string ListLogIndexes(ClientContext &context) const;
 
 private:
+#ifndef __EMSCRIPTEN__
 	//! Lazily created on first use and reused (HTTP keep-alive) for every later request. Mutable
 	//! because request methods are const — scans share const bind data — yet
 	//! must cache the socket. Reset (and re-established on the next request) after a transport
@@ -59,6 +62,7 @@ private:
 
 	//! Return the shared connection, creating and configuring it on the first call.
 	duckdb_httplib_openssl::Client &GetConnection() const;
+#endif
 
 	//! Perform an authenticated GET or POST. A null body selects GET; otherwise POST JSON.
 	string AuthenticatedRequest(ClientContext &context, const string &path, const string *body,

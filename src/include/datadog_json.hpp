@@ -38,7 +38,15 @@ DatadogResolvedSearch ResolveDatadogSearch(const string &query, const string &fr
 
 //! Build the POST body used by the Datadog Logs Search API. The indexes field is
 //! omitted when `indexes` is empty so read_datadog_logs retains its existing request shape.
-string BuildDatadogLogsSearchBody(const string &query, const string &from, const string &to, int64_t limit,
-                                  const string &cursor, const vector<string> &indexes = {});
+string BuildDatadogLogsSearchBody(const string &query, const string &from, const string &to, const string &sort,
+                                  int64_t limit, const string &cursor, const vector<string> &indexes = {});
+
+//! Return the next outgoing page limit. A positive max_rows reduces the request to the
+//! unreserved portion of the bounded relation's row budget.
+int64_t GetDatadogLogsPageLimit(int64_t page_size, int64_t max_rows, idx_t row_budget_used);
+
+//! True once a positive max_rows cap has been emitted. Scans use this to stop before
+//! requesting another cursor page.
+bool DatadogLogsMaxRowsReached(int64_t max_rows, idx_t total_emitted);
 
 } // namespace duckdb

@@ -35,8 +35,9 @@ namespace {
 
 class DatadogTableEntry : public TableCatalogEntry {
 public:
-	DatadogTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, const string &index_name, const string &secret_name)
-	    : DatadogTableEntry(catalog, schema, index_name, secret_name, CreateInfo(schema, index_name)) {
+	DatadogTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, const string &index_name, const string &secret_name,
+	                  const DatadogLogsSettings &settings)
+	    : DatadogTableEntry(catalog, schema, index_name, secret_name, settings, CreateInfo(schema, index_name)) {
 	}
 
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &, column_t) override {
@@ -44,7 +45,7 @@ public:
 	}
 
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override {
-		return GetDatadogLogsTableScan(context, *this, secret_name, index_name, bind_data);
+		return GetDatadogLogsTableScan(context, *this, secret_name, index_name, settings, bind_data);
 	}
 
 	TableStorageInfo GetStorageInfo(ClientContext &) override {
@@ -53,8 +54,9 @@ public:
 
 private:
 	DatadogTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, const string &index_name, const string &secret_name,
-	                  CreateTableInfo info)
-	    : TableCatalogEntry(catalog, schema, info), index_name(index_name), secret_name(secret_name) {
+	                  const DatadogLogsSettings &settings, CreateTableInfo info)
+	    : TableCatalogEntry(catalog, schema, info), index_name(index_name), secret_name(secret_name),
+	      settings(settings) {
 	}
 
 	static CreateTableInfo CreateInfo(SchemaCatalogEntry &schema, const string &index_name) {
@@ -70,20 +72,22 @@ private:
 
 	string index_name;
 	string secret_name;
+	DatadogLogsSettings settings;
 };
 
 class DatadogSchemaEntry : public SchemaCatalogEntry {
 public:
-	DatadogSchemaEntry(Catalog &catalog, const vector<string> &indexes, const string &secret_name)
-	    : DatadogSchemaEntry(catalog, indexes, secret_name, CreateInfo()) {
+	DatadogSchemaEntry(Catalog &catalog, const vector<string> &indexes, const string &secret_name,
+	                   const DatadogLogsSettings &settings)
+	    : DatadogSchemaEntry(catalog, indexes, secret_name, settings, CreateInfo()) {
 	}
 
 private:
 	DatadogSchemaEntry(Catalog &catalog, const vector<string> &indexes, const string &secret_name,
-	                   CreateSchemaInfo info)
+	                   const DatadogLogsSettings &settings, CreateSchemaInfo info)
 	    : SchemaCatalogEntry(catalog, info) {
 		for (const auto &index : indexes) {
-			tables.push_back(make_uniq<DatadogTableEntry>(catalog, *this, index, secret_name));
+			tables.push_back(make_uniq<DatadogTableEntry>(catalog, *this, index, secret_name, settings));
 		}
 	}
 
@@ -173,8 +177,9 @@ private:
 
 class DatadogCatalog : public Catalog {
 public:
-	DatadogCatalog(AttachedDatabase &db, vector<string> indexes, string secret_name)
-	    : Catalog(db), logs_schema(make_uniq<DatadogSchemaEntry>(*this, indexes, secret_name)) {
+	DatadogCatalog(AttachedDatabase &db, vector<string> indexes, string secret_name,
+	               const DatadogLogsSettings &settings)
+	    : Catalog(db), logs_schema(make_uniq<DatadogSchemaEntry>(*this, indexes, secret_name, settings)) {
 	}
 
 	void Initialize(bool) override {
@@ -307,6 +312,13 @@ static vector<string> ParseExplicitIndexes(const Value &value) {
 	return result;
 }
 
+static int64_t ParseAttachInteger(const string &option_name, const Value &value) {
+	if (value.IsNull() || !value.type().IsIntegral()) {
+		throw InvalidInputException("Datadog ATTACH option %s must be a non-null integer", option_name);
+	}
+	return value.GetValue<int64_t>();
+}
+
 static unique_ptr<Catalog> AttachDatadog(optional_ptr<StorageExtensionInfo>, ClientContext &context,
                                          AttachedDatabase &db, const string &, AttachInfo &info,
                                          AttachOptions &options) {
@@ -316,6 +328,7 @@ static unique_ptr<Catalog> AttachDatadog(optional_ptr<StorageExtensionInfo>, Cli
 
 	string secret_name;
 	vector<string> indexes;
+	DatadogLogsSettings settings;
 	bool indexes_supplied = false;
 	for (const auto &option : options.options) {
 		auto key = StringUtil::Lower(option.first);
@@ -330,11 +343,27 @@ static unique_ptr<Catalog> AttachDatadog(optional_ptr<StorageExtensionInfo>, Cli
 		} else if (key == "indexes") {
 			indexes = ParseExplicitIndexes(option.second);
 			indexes_supplied = true;
+		} else if (key == "sort") {
+			if (option.second.IsNull() || option.second.type().id() != LogicalTypeId::VARCHAR) {
+				throw InvalidInputException("Datadog ATTACH option SORT must be a non-null VARCHAR");
+			}
+			settings.sort = option.second.GetValue<string>();
+		} else if (key == "page_size") {
+			settings.page_size = ParseAttachInteger("PAGE_SIZE", option.second);
+		} else if (key == "max_rows") {
+			settings.max_rows = ParseAttachInteger("MAX_ROWS", option.second);
+		} else if (key == "retries") {
+			settings.retries = ParseAttachInteger("RETRIES", option.second);
+		} else if (key == "timeout") {
+			settings.timeout_seconds = ParseAttachInteger("TIMEOUT", option.second);
 		} else {
 			throw InvalidInputException(
-			    "Unsupported Datadog ATTACH option '%s'; supported options are SECRET and INDEXES", option.first);
+			    "Unsupported Datadog ATTACH option '%s'; supported options are SECRET, INDEXES, "
+			    "SORT, PAGE_SIZE, MAX_ROWS, RETRIES, and TIMEOUT",
+			    option.first);
 		}
 	}
+	ValidateDatadogLogsSettings(settings, "Datadog ATTACH");
 
 	// Always validate/select the secret at attach time, but retain only its name. Explicit
 	// INDEXES never performs a network request.
@@ -349,11 +378,13 @@ static unique_ptr<Catalog> AttachDatadog(optional_ptr<StorageExtensionInfo>, Cli
 		client.site = credentials.site;
 		client.api_key = credentials.api_key;
 		client.app_key = credentials.app_key;
+		client.retries = static_cast<uint64_t>(settings.retries);
+		client.timeout_seconds = static_cast<uint64_t>(settings.timeout_seconds);
 		indexes = ParseDatadogLogIndexes(client.ListLogIndexes(context));
 	}
 
 	db.SetReadOnlyDatabase();
-	return make_uniq<DatadogCatalog>(db, std::move(indexes), std::move(secret_name));
+	return make_uniq<DatadogCatalog>(db, std::move(indexes), std::move(secret_name), settings);
 }
 
 static unique_ptr<TransactionManager> CreateDatadogTransactionManager(optional_ptr<StorageExtensionInfo>,

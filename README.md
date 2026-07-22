@@ -78,9 +78,40 @@ input order and spelling are preserved. Omitting `SECRET` uses the same first in
 secret selection as `read_datadog_logs`.
 
 Every catalog table has the same 18-column schema as `read_datadog_logs` and uses the reader's
-current defaults: query `*`, from `now-15m` to `now`. The catalog is read-only. Use
-`read_datadog_logs` when you need a custom query, time window, page size, row cap, retry budget, or
-timeout.
+current defaults: query `*`, from `now-15m` to `now`, ascending `timestamp` sort, page size 1000,
+unlimited rows, four retries, and a 60-second request timeout. The catalog is read-only. Use
+`read_datadog_logs` when you need a custom query or time window.
+
+For a bounded latest-logs relation suitable for an interactive browser query, configure the
+attachment explicitly:
+
+```sql
+ATTACH 'datadog:' AS dd (
+    TYPE datadog,
+    SECRET dd_web,
+    INDEXES ['main'],
+    SORT '-timestamp',
+    PAGE_SIZE 100,
+    MAX_ROWS 100,
+    RETRIES 0
+);
+
+SELECT time_unix_nano, service_name, severity_text, body
+FROM dd.logs.main
+ORDER BY time_unix_nano DESC
+LIMIT 100;
+```
+
+This configuration asks Datadog for the newest records first and makes at most one logs-search
+request with a page limit of 100. `MAX_ROWS` changes every catalog table in that attachment into a
+bounded source relation; `COUNT(*)`, exports, joins, and aggregations see only that bounded set, not
+the full matching Datadog window. Omit `MAX_ROWS` (or set it to 0) to preserve an unlimited catalog
+scan.
+
+This is explicit catalog configuration, not automatic SQL `ORDER BY`/`LIMIT` or Top-N optimizer
+pushdown. DuckDB still evaluates the SQL ordering and limit locally. `SORT`, `PAGE_SIZE`,
+`MAX_ROWS`, `RETRIES`, and `TIMEOUT` are attachment-wide and apply to every index table in that
+catalog; `TIMEOUT` is measured in seconds.
 
 A small, conservative subset of SQL predicates is pushed into Datadog while the original `WHERE`
 clause is still evaluated by DuckDB for exact SQL semantics:
@@ -109,6 +140,7 @@ non-literal comparisons—remain local DuckDB filters.
 | `query`     | VARCHAR | `*`        | Datadog log search query. |
 | `from`      | VARCHAR | `now-15m`  | Start of the time window. |
 | `to`        | VARCHAR | `now`      | End of the time window. |
+| `sort`      | VARCHAR | `timestamp` | Datadog sort: `timestamp` (oldest first) or `-timestamp` (newest first). |
 | `page_size` | BIGINT  | `1000`     | Rows fetched per API request (1–1000, the Datadog max). |
 | `max_rows`  | BIGINT  | unlimited  | Safety cap on total rows returned. |
 | `retries`   | BIGINT  | `4`        | Retry budget for transient failures (HTTP 429/5xx, network errors); 0 disables retrying. |
@@ -116,9 +148,11 @@ non-literal comparisons—remain local DuckDB filters.
 | `secret`    | VARCHAR | first `datadog` secret | Name of a specific secret to use. |
 
 The function pages through the whole window for you by following Datadog's cursor
-(`meta.page.after`), sorted ascending by timestamp. Results stream page-by-page and are never
-fully buffered in memory. For a window so large it exceeds Datadog's cursor depth, page through it
-by calling the function once per narrower sub-range (e.g. an hour at a time).
+(`meta.page.after`) in the configured timestamp order. Results stream page-by-page and are never
+fully buffered in memory. When `max_rows` is positive, each request is limited to the smaller of
+`page_size` and the remaining row budget, and pagination stops at the cap. For a window so large it
+exceeds Datadog's cursor depth, page through it by calling the function once per narrower sub-range
+(e.g. an hour at a time).
 
 Transient failures are retried automatically: HTTP 429 waits out the server-advised rate-limit
 reset (`X-RateLimit-Reset` / `Retry-After`), and HTTP 5xx or dropped connections retry with

@@ -146,8 +146,8 @@ DatadogResolvedSearch ResolveDatadogSearch(const string &query, const string &fr
 	return result;
 }
 
-string BuildDatadogLogsSearchBody(const string &query, const string &from, const string &to, int64_t limit,
-                                  const string &cursor, const vector<string> &indexes) {
+string BuildDatadogLogsSearchBody(const string &query, const string &from, const string &to, const string &sort,
+                                  int64_t limit, const string &cursor, const vector<string> &indexes) {
 	YyjsonMutDocPtr doc(yyjson_mut_doc_new(nullptr));
 	auto root = yyjson_mut_obj(doc.get());
 	yyjson_mut_doc_set_root(doc.get(), root);
@@ -165,8 +165,7 @@ string BuildDatadogLogsSearchBody(const string &query, const string &from, const
 	}
 	yyjson_mut_obj_add_val(doc.get(), root, "filter", filter);
 
-	// Ascending, stable sort so cursor pagination returns a deterministic ordering.
-	yyjson_mut_obj_add_strcpy(doc.get(), root, "sort", "timestamp");
+	yyjson_mut_obj_add_strcpy(doc.get(), root, "sort", sort.c_str());
 
 	auto page = yyjson_mut_obj(doc.get());
 	yyjson_mut_obj_add_int(doc.get(), page, "limit", limit);
@@ -177,6 +176,21 @@ string BuildDatadogLogsSearchBody(const string &query, const string &from, const
 
 	YyjsonStrPtr json(yyjson_mut_write(doc.get(), 0, nullptr));
 	return json ? string(json.get()) : string();
+}
+
+bool DatadogLogsMaxRowsReached(int64_t max_rows, idx_t total_emitted) {
+	return max_rows > 0 && total_emitted >= static_cast<idx_t>(max_rows);
+}
+
+int64_t GetDatadogLogsPageLimit(int64_t page_size, int64_t max_rows, idx_t row_budget_used) {
+	if (max_rows <= 0) {
+		return page_size;
+	}
+	if (row_budget_used >= static_cast<idx_t>(max_rows)) {
+		return 0;
+	}
+	auto remaining = static_cast<int64_t>(static_cast<idx_t>(max_rows) - row_budget_used);
+	return MinValue<int64_t>(page_size, remaining);
 }
 
 } // namespace duckdb

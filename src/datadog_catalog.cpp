@@ -189,7 +189,7 @@ public:
 
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override {
 		return GetDatadogOpenAlertsTableScan(context, *this, secret_name, settings.retries, settings.timeout_seconds,
-		                                      bind_data);
+		                                     bind_data);
 	}
 
 	TableStorageInfo GetStorageInfo(ClientContext &) override {

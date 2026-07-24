@@ -98,6 +98,78 @@ int main() {
 		pushed.upper_bound_ms = 1700000;
 		Require(ResolveDatadogSearch("*", "1100000", "2000000", pushed).empty,
 		        "disjoint pushed timestamps in an absolute window should avoid a network request");
+
+		// --- Log intake body (send_datadog_logs) ---------------------------------------------
+		Require(BuildDatadogIntakeBody({}) == "[]", "an empty send should produce an empty JSON array");
+
+		DatadogIntakeLog basic;
+		basic.message = "hello world";
+		basic.service = "web-store";
+		basic.status = "error";
+		basic.ddsource = "duckdb";
+		basic.has_timestamp_ms = true;
+		basic.timestamp_ms = 1750000000000;
+		auto basic_body = BuildDatadogIntakeBody({basic});
+		Require(basic_body.front() == '[' && basic_body.back() == ']', "intake body must be a JSON array");
+		Require(basic_body.find("\"message\":\"hello world\"") != string::npos, "message maps from OTLP body");
+		Require(basic_body.find("\"service\":\"web-store\"") != string::npos, "service maps from service_name");
+		Require(basic_body.find("\"status\":\"error\"") != string::npos, "status maps from severity_text");
+		Require(basic_body.find("\"timestamp\":1750000000000") != string::npos, "timestamp is emitted as epoch ms");
+
+		// Absent fields are omitted rather than emitted as null/empty.
+		DatadogIntakeLog sparse;
+		sparse.message = "only a message";
+		auto sparse_body = BuildDatadogIntakeBody({sparse});
+		Require(sparse_body.find("\"service\"") == string::npos, "absent service must be omitted");
+		Require(sparse_body.find("\"timestamp\"") == string::npos, "absent timestamp must be omitted");
+
+		// resource_attributes supplies host and ddtags when not set directly.
+		DatadogIntakeLog with_resource;
+		with_resource.message = "m";
+		with_resource.resource_attributes_json = R"({"host":"host-1","ddtags":["env:prod","team:core"]})";
+		auto resource_body = BuildDatadogIntakeBody({with_resource});
+		Require(resource_body.find("\"hostname\":\"host-1\"") != string::npos,
+		        "hostname should fall back to resource_attributes.host");
+		Require(resource_body.find("\"ddtags\":\"env:prod,team:core\"") != string::npos,
+		        "ddtags should fall back to comma-joined resource_attributes.ddtags");
+		Require(resource_body.find("\"resource_attributes\":{") != string::npos,
+		        "the full resource block should be preserved as a nested object");
+
+		// An explicit hostname wins over the resource host.
+		DatadogIntakeLog host_override;
+		host_override.hostname = "explicit-host";
+		host_override.resource_attributes_json = R"({"host":"resource-host"})";
+		auto host_body = BuildDatadogIntakeBody({host_override});
+		Require(host_body.find("\"hostname\":\"explicit-host\"") != string::npos,
+		        "an explicit hostname must not be overwritten by the resource host");
+		Require(host_body.find("resource-host") != string::npos,
+		        "the resource host is still preserved in the nested block");
+
+		// log_attributes keys become top-level custom attributes but never clobber reserved keys.
+		DatadogIntakeLog with_attrs;
+		with_attrs.message = "reserved-message";
+		with_attrs.log_attributes_json = R"({"trace_id":"abc","user_id":"42","message":"should-not-win"})";
+		auto attrs_body = BuildDatadogIntakeBody({with_attrs});
+		Require(attrs_body.find("\"user_id\":\"42\"") != string::npos, "log_attributes keys are merged top-level");
+		Require(attrs_body.find("\"message\":\"reserved-message\"") != string::npos,
+		        "reserved keys must win over colliding log_attributes keys");
+		Require(attrs_body.find("should-not-win") == string::npos,
+		        "a colliding log_attributes value must not overwrite a reserved attribute");
+
+		// Malformed attribute JSON is skipped, not fatal.
+		DatadogIntakeLog malformed;
+		malformed.message = "m";
+		malformed.log_attributes_json = "{not valid json";
+		malformed.resource_attributes_json = "]]";
+		auto malformed_body = BuildDatadogIntakeBody({malformed});
+		Require(malformed_body.find("\"message\":\"m\"") != string::npos,
+		        "malformed attribute JSON should be ignored without failing the build");
+
+		// Multiple logs produce a two-element array.
+		auto multi_body = BuildDatadogIntakeBody({basic, sparse});
+		size_t first = multi_body.find("\"message\"");
+		Require(first != string::npos && multi_body.find("\"message\"", first + 1) != string::npos,
+		        "each input log should appear as its own array element");
 	} catch (const std::exception &error) {
 		std::cerr << "datadog_json_test failed: " << error.what() << std::endl;
 		return 1;

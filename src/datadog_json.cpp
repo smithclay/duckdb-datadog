@@ -178,6 +178,137 @@ string BuildDatadogLogsSearchBody(const string &query, const string &from, const
 	return json ? string(json.get()) : string();
 }
 
+//! Merge every key of the JSON object `source_json` into `dest` as a top-level custom attribute,
+//! skipping any key already present (reserved attributes set earlier always win). Non-object or
+//! unparseable input is silently ignored so a malformed attribute column never fails the send.
+static void MergeJsonObjectAttributes(yyjson_mut_doc *doc, yyjson_mut_val *dest, const string &source_json) {
+	if (source_json.empty()) {
+		return;
+	}
+	YyjsonDocPtr parsed(yyjson_read(source_json.c_str(), source_json.size(), 0));
+	if (!parsed) {
+		return;
+	}
+	yyjson_val *root = yyjson_doc_get_root(parsed.get());
+	if (!root || !yyjson_is_obj(root)) {
+		return;
+	}
+	yyjson_obj_iter iter;
+	yyjson_obj_iter_init(root, &iter);
+	yyjson_val *key;
+	while ((key = yyjson_obj_iter_next(&iter))) {
+		const char *key_str = yyjson_get_str(key);
+		if (!key_str || yyjson_mut_obj_get(dest, key_str)) {
+			continue; // reserved / already-set keys are never overwritten
+		}
+		yyjson_val *val = yyjson_obj_iter_get_val(key);
+		yyjson_mut_val *mut_key = yyjson_mut_strcpy(doc, key_str);
+		yyjson_mut_val *mut_val = yyjson_val_mut_copy(doc, val);
+		if (mut_key && mut_val) {
+			yyjson_mut_obj_add(dest, mut_key, mut_val);
+		}
+	}
+}
+
+//! If `resource_json` is a JSON object, nest it under `resource_attributes` and, when the caller has
+//! not already set them, derive `hostname` from its `host` string and `ddtags` from its `ddtags`
+//! string array (comma-joined, matching Datadog's tag encoding).
+static void ApplyResourceAttributes(yyjson_mut_doc *doc, yyjson_mut_val *obj, const string &resource_json,
+                                    bool have_hostname, bool have_ddtags) {
+	if (resource_json.empty()) {
+		return;
+	}
+	YyjsonDocPtr parsed(yyjson_read(resource_json.c_str(), resource_json.size(), 0));
+	if (!parsed) {
+		return;
+	}
+	yyjson_val *root = yyjson_doc_get_root(parsed.get());
+	if (!root || !yyjson_is_obj(root)) {
+		return;
+	}
+
+	if (!have_hostname) {
+		yyjson_val *host = yyjson_obj_get(root, "host");
+		if (host && yyjson_is_str(host)) {
+			yyjson_mut_obj_add_strcpy(doc, obj, "hostname", yyjson_get_str(host));
+		}
+	}
+	if (!have_ddtags) {
+		yyjson_val *tags = yyjson_obj_get(root, "ddtags");
+		if (tags && yyjson_is_arr(tags) && yyjson_arr_size(tags) > 0) {
+			string joined;
+			size_t idx, max;
+			yyjson_val *tag;
+			yyjson_arr_foreach(tags, idx, max, tag) {
+				if (!yyjson_is_str(tag)) {
+					continue;
+				}
+				if (!joined.empty()) {
+					joined += ",";
+				}
+				joined += yyjson_get_str(tag);
+			}
+			if (!joined.empty()) {
+				yyjson_mut_obj_add_strcpy(doc, obj, "ddtags", joined.c_str());
+			}
+		}
+	}
+
+	// Preserve the full resource block so nothing is lost even when host/ddtags were already set.
+	yyjson_mut_val *copy = yyjson_val_mut_copy(doc, root);
+	if (copy) {
+		yyjson_mut_obj_add(obj, yyjson_mut_strcpy(doc, "resource_attributes"), copy);
+	}
+}
+
+string BuildDatadogIntakeBody(const vector<DatadogIntakeLog> &logs) {
+	YyjsonMutDocPtr doc(yyjson_mut_doc_new(nullptr));
+	auto arr = yyjson_mut_arr(doc.get());
+	yyjson_mut_doc_set_root(doc.get(), arr);
+
+	for (const auto &log : logs) {
+		auto obj = yyjson_mut_obj(doc.get());
+
+		// Reserved Datadog attributes first, so log_attributes can never clobber them.
+		if (!log.message.empty()) {
+			yyjson_mut_obj_add_strcpy(doc.get(), obj, "message", log.message.c_str());
+		}
+		if (!log.service.empty()) {
+			yyjson_mut_obj_add_strcpy(doc.get(), obj, "service", log.service.c_str());
+		}
+		if (!log.status.empty()) {
+			yyjson_mut_obj_add_strcpy(doc.get(), obj, "status", log.status.c_str());
+		}
+		if (!log.ddsource.empty()) {
+			yyjson_mut_obj_add_strcpy(doc.get(), obj, "ddsource", log.ddsource.c_str());
+		}
+		if (!log.hostname.empty()) {
+			yyjson_mut_obj_add_strcpy(doc.get(), obj, "hostname", log.hostname.c_str());
+		}
+		if (!log.ddtags.empty()) {
+			yyjson_mut_obj_add_strcpy(doc.get(), obj, "ddtags", log.ddtags.c_str());
+		}
+		if (log.has_timestamp_ms) {
+			yyjson_mut_obj_add_int(doc.get(), obj, "timestamp", log.timestamp_ms);
+		}
+		if (!log.trace_id.empty()) {
+			yyjson_mut_obj_add_strcpy(doc.get(), obj, "trace_id", log.trace_id.c_str());
+		}
+		if (!log.span_id.empty()) {
+			yyjson_mut_obj_add_strcpy(doc.get(), obj, "span_id", log.span_id.c_str());
+		}
+
+		ApplyResourceAttributes(doc.get(), obj, log.resource_attributes_json, !log.hostname.empty(),
+		                        !log.ddtags.empty());
+		MergeJsonObjectAttributes(doc.get(), obj, log.log_attributes_json);
+
+		yyjson_mut_arr_append(arr, obj);
+	}
+
+	YyjsonStrPtr json(yyjson_mut_write(doc.get(), 0, nullptr));
+	return json ? string(json.get()) : string("[]");
+}
+
 bool DatadogLogsMaxRowsReached(int64_t max_rows, idx_t total_emitted) {
 	return max_rows > 0 && total_emitted >= static_cast<idx_t>(max_rows);
 }

@@ -16,11 +16,30 @@ SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'read_datadog
 ----
 true
 
+# The sender is registered.
+query I
+SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'send_datadog_logs';
+----
+true
+
 # Calling it without any datadog secret gives a helpful error (this only binds; no network call).
 statement error
 SELECT * FROM read_datadog_logs(query => '*', "from" => 'now-15m', "to" => 'now');
 ----
 No 'datadog' secret found
+
+# send_datadog_logs resolves credentials at bind time, so without a secret binding already fails
+# (DESCRIBE binds without executing, so no log is actually sent).
+statement error
+DESCRIBE SELECT send_datadog_logs({'body': 'hi', 'service_name': 's'});
+----
+No 'datadog' secret found
+
+# A non-struct argument is rejected at bind time with a helpful message.
+statement error
+DESCRIBE SELECT send_datadog_logs('not a struct');
+----
+must be a STRUCT
 
 # Catalog attachment validates credentials before doing anything else. Explicit INDEXES keeps
 # this path offline while preserving the same helpful missing-secret error.
@@ -64,6 +83,24 @@ WHERE column_name IN ('time_unix_nano', 'observed_time_unix_nano', 'trace_id', '
                       'severity_text', 'body', 'resource_attributes', 'log_attributes', 'flags');
 ----
 10
+
+# With a secret present, send_datadog_logs binds to a VARCHAR result for any struct shape. Extra
+# columns are ignored and missing OTLP columns are tolerated (bind only; no log is sent).
+query I
+SELECT count(*) FROM (DESCRIBE SELECT send_datadog_logs({'body': 'hi', 'service_name': 's', 'unknown_extra': 1}));
+----
+1
+
+query I
+SELECT column_type FROM (DESCRIBE SELECT send_datadog_logs({'body': 'hi'}));
+----
+VARCHAR
+
+# The two-argument form (explicit secret name) also binds; an unknown secret name is a bind error.
+statement error
+DESCRIBE SELECT send_datadog_logs({'body': 'hi'}, 'no_such_secret');
+----
+No secret with name 'no_such_secret' found
 
 # Named parameters are validated at bind time (no network call is needed to hit these errors).
 statement error

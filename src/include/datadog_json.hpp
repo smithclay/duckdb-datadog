@@ -41,6 +41,30 @@ DatadogResolvedSearch ResolveDatadogSearch(const string &query, const string &fr
 string BuildDatadogLogsSearchBody(const string &query, const string &from, const string &to, const string &sort,
                                   int64_t limit, const string &cursor, const vector<string> &indexes = {});
 
+//! One OTLP-shaped log to send through the Datadog log intake API. Every string field is optional;
+//! an empty string means "absent" and the corresponding Datadog attribute is omitted. `host` and
+//! `ddtags` fall back to values discovered inside `resource_attributes_json` when left empty.
+struct DatadogIntakeLog {
+	string message;                  //! OTLP body -> reserved `message`
+	string service;                  //! OTLP service_name -> reserved `service`
+	string status;                   //! OTLP severity_text -> reserved `status`
+	string hostname;                 //! -> reserved `hostname` (falls back to resource host)
+	string ddsource;                 //! -> reserved `ddsource`
+	string ddtags;                   //! comma-separated -> reserved `ddtags` (falls back to resource ddtags)
+	string trace_id;                 //! -> custom attribute `trace_id`
+	string span_id;                  //! -> custom attribute `span_id`
+	bool has_timestamp_ms = false;   //! whether `timestamp_ms` is set
+	int64_t timestamp_ms = 0;        //! epoch milliseconds -> reserved `timestamp`
+	string log_attributes_json;      //! JSON object; keys merged as top-level custom attributes
+	string resource_attributes_json; //! JSON object; nested under `resource_attributes`, mined for host/ddtags
+};
+
+//! Build the JSON array body for `POST https://http-intake.logs.<site>/api/v2/logs` from OTLP-shaped
+//! logs. Reserved attributes are set from the matching fields; `hostname`/`ddtags` fall back to
+//! `resource_attributes`; `log_attributes` keys become top-level custom attributes without ever
+//! overwriting an already-set reserved key. Malformed attribute JSON is skipped rather than fatal.
+string BuildDatadogIntakeBody(const vector<DatadogIntakeLog> &logs);
+
 //! Return the next outgoing page limit. A positive max_rows reduces the request to the
 //! unreserved portion of the bounded relation's row budget.
 int64_t GetDatadogLogsPageLimit(int64_t page_size, int64_t max_rows, idx_t row_budget_used);

@@ -1,11 +1,13 @@
 # duckdb-datadog
 
 A DuckDB extension that reads logs from the [Datadog Logs Search API v2](https://docs.datadoghq.com/api/latest/logs/)
-directly into DuckDB tables. Rows conform to the
+directly into DuckDB tables, and sends OTLP-shaped log tables back to Datadog through the
+[log intake API](https://docs.datadoghq.com/api/latest/logs/#send-logs). Rows conform to the
 [duckdb-otlp](https://github.com/smithclay/otlp2records) `read_otlp_logs` schema, so Datadog logs
 drop straight into an OTLP-shaped lakehouse alongside data from other sources.
 
-Logs are supported today; traces/spans and metrics are planned.
+Reading and sending logs are supported today; traces/spans and metrics are planned. See
+[Sending logs](#sending-logs) for the `send_datadog_logs` scalar function.
 
 ## Quick start
 
@@ -179,6 +181,54 @@ JSON — Datadog custom attributes); `dropped_attributes_count`, `flags` (INTEGE
 Because attribute columns are JSON strings, query them with DuckDB's JSON functions, e.g.
 `SELECT log_attributes->>'$.http.status_code' FROM logs`.
 
+## Sending logs
+
+`send_datadog_logs` pushes an OTLP-shaped log table into a Datadog account through the
+[log intake API](https://docs.datadoghq.com/api/latest/logs/#send-logs). It takes a single `STRUCT`
+argument — pass a whole row by naming the table — and returns `'ok'` for each accepted row:
+
+```sql
+LOAD datadog;
+
+-- Uses the first in-scope `datadog` secret (only API_KEY is required to send; SITE is honored).
+SELECT send_datadog_logs(l) FROM my_logs l;
+
+-- Or name a specific secret:
+SELECT send_datadog_logs(l, 'dd_prod') FROM my_logs l;
+```
+
+Any struct works, so you can copy logs straight from one Datadog window to another, from a Parquet
+file, or from duckdb-otlp's `read_otlp_logs`:
+
+```sql
+SELECT send_datadog_logs(l)
+FROM read_datadog_logs(query => 'service:web-store', "from" => 'now-15m', "to" => 'now') l;
+```
+
+Recognized columns are mapped loosely by name; **unknown columns are ignored** and missing columns
+are simply omitted:
+
+| Struct column (first match wins)                | Datadog intake attribute                          |
+| ----------------------------------------------- | ------------------------------------------------- |
+| `body` / `message`                              | `message`                                         |
+| `service_name` / `service`                      | `service`                                         |
+| `severity_text` / `severity` / `status`         | `status` (falls back to `severity_number`)        |
+| `hostname` / `host`                             | `hostname` (falls back to `resource_attributes.host`) |
+| `ddsource`                                       | `ddsource` (defaults to `duckdb`)                 |
+| `time_unix_nano` / `timestamp`                  | `timestamp` (epoch ms; `observed_time_unix_nano` fallback) |
+| `ddtags`                                        | `ddtags` (falls back to `resource_attributes.ddtags`) |
+| `trace_id`, `span_id`                           | custom attributes                                 |
+| `resource_attributes` (JSON)                    | nested `resource_attributes`, mined for host/tags |
+| `log_attributes` (JSON object)                  | merged as top-level custom attributes             |
+
+Notes:
+- Rows are batched into intake requests of up to 1000 logs each; the function shares the reader's
+  retry, backoff, and cancellation behavior. A failed request raises an error.
+- `log_attributes` keys never overwrite a reserved attribute already set from another column.
+- Datadog drops logs whose `timestamp` is more than ~18h in the past; when replaying old data,
+  either omit the timestamp column or expect those logs not to be indexed.
+- A `NULL` log struct maps to a `NULL` result and is not sent.
+
 ## Building
 
 Native dependencies are minimal: only OpenSSL (via vcpkg). HTTP (cpp-httplib) and JSON (yyjson)
@@ -218,11 +268,12 @@ are fully offline (no network).
 
 ### End-to-end test
 
-`test/e2e/run_e2e.sh` exercises the full round-trip against a real Datadog account: it sends a
-uniquely-tagged log via the log intake API, then reads it back through `read_datadog_logs` and
-asserts the mapping. It shares credentials with the [`pup` CLI](https://docs.datadoghq.com/cli/)
-(`DD_API_KEY` / `DD_APP_KEY` / `DD_SITE`) and, when `pup` is installed, uses it for an auth-status
-check and an independent cross-check of the ingested log.
+`test/e2e/run_e2e.sh` exercises the full round-trip against a real Datadog account. It sends a
+uniquely-tagged log via the log intake API and reads it back through `read_datadog_logs` (asserting
+the mapping), then sends a second log **through the extension** with `send_datadog_logs` and polls
+until it is searchable — validating the write path end to end. It shares credentials with the
+[`pup` CLI](https://docs.datadoghq.com/cli/) (`DD_API_KEY` / `DD_APP_KEY` / `DD_SITE`) and, when
+`pup` is installed, uses it for an auth-status check and an independent cross-check of the ingested log.
 
 ```shell
 make release                                   # build the duckdb binary + extension first

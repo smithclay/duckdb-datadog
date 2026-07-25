@@ -38,6 +38,12 @@ static string NormalizeSite(const string &raw) {
 	return s.empty() ? "datadoghq.com" : s;
 }
 
+//! Base URL for the log intake API. This is a distinct host from the search/config API
+//! (`api.<site>`); logs are always accepted at `https://http-intake.logs.<site>`.
+static string BuildIntakeBaseUrl(const string &site) {
+	return "https://http-intake.logs." + NormalizeSite(site);
+}
+
 static string BuildBaseUrl(const string &site) {
 #ifdef __EMSCRIPTEN__
 	string browser_site = site;
@@ -78,6 +84,14 @@ DatadogClient::DatadogClient() = default;
 DatadogClient::~DatadogClient() {
 }
 
+void DatadogClient::CopyConfigTo(DatadogClient &target) const {
+	target.site = site;
+	target.api_key = api_key;
+	target.app_key = app_key;
+	target.timeout_seconds = timeout_seconds;
+	target.retries = retries;
+}
+
 #ifndef __EMSCRIPTEN__
 duckdb_httplib_openssl::Client &DatadogClient::GetConnection() const {
 	if (!connection) {
@@ -93,6 +107,16 @@ duckdb_httplib_openssl::Client &DatadogClient::GetConnection() const {
 	return *connection;
 }
 
+duckdb_httplib_openssl::Client &DatadogClient::GetIntakeConnection() const {
+	if (!intake_connection) {
+		intake_connection = make_uniq<duckdb_httplib_openssl::Client>(BuildIntakeBaseUrl(site));
+		intake_connection->set_connection_timeout(static_cast<time_t>(timeout_seconds), 0);
+		intake_connection->set_read_timeout(static_cast<time_t>(timeout_seconds), 0);
+		intake_connection->set_keep_alive(true);
+	}
+	return *intake_connection;
+}
+
 //! Sleep for `seconds`, polling the query's interrupt flag so a cancelled query (Ctrl+C) aborts
 //! the wait within ~100ms instead of blocking a scan thread for the full retry delay.
 static void SleepCheckingInterrupt(ClientContext &context, uint64_t seconds) {
@@ -102,6 +126,22 @@ static void SleepCheckingInterrupt(ClientContext &context, uint64_t seconds) {
 			throw InterruptException();
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	}
+}
+
+//! Transport errors that are guaranteed to have happened *before* any request bytes reached the
+//! server, so retrying them cannot duplicate a write. The log intake endpoint is not idempotent, so
+//! SendLogs only retries these (a Read/Write/Unknown error may mean the batch was already accepted
+//! and its 202 response was merely lost — retrying that would double-index the logs).
+static bool IsPreSendTransportError(duckdb_httplib_openssl::Error error) {
+	switch (error) {
+	case duckdb_httplib_openssl::Error::Connection:
+	case duckdb_httplib_openssl::Error::ConnectionTimeout:
+	case duckdb_httplib_openssl::Error::BindIPAddress:
+	case duckdb_httplib_openssl::Error::ProxyConnection:
+		return true;
+	default:
+		return false;
 	}
 }
 
@@ -260,6 +300,100 @@ string DatadogClient::SearchLogs(ClientContext &context, const string &request_b
 
 string DatadogClient::ListLogIndexes(ClientContext &context) const {
 	return AuthenticatedRequest(context, "/api/v1/logs/config/indexes", nullptr, true);
+}
+
+string DatadogClient::SendLogs(ClientContext &context, const string &intake_body_json) const {
+	constexpr const char *INTAKE_PATH = "/api/v2/logs";
+#ifdef __EMSCRIPTEN__
+	if (context.interrupted) {
+		throw InterruptException();
+	}
+
+	const auto base_url = BuildIntakeBaseUrl(site);
+	const auto url = base_url + INTAKE_PATH;
+	auto &http_util = HTTPUtil::Get(*context.db);
+	auto params = http_util.InitializeParameters(context, url);
+	params->timeout = timeout_seconds;
+	// The log intake endpoint is not idempotent, so do not let the browser transport blindly retry a
+	// write whose response may have been lost — that would double-index the batch.
+	params->retries = 0;
+	params->keep_alive = true;
+	params->follow_location = false;
+
+	HTTPHeaders headers;
+	headers.Insert("DD-API-KEY", api_key);
+	headers.Insert("Content-Type", "application/json");
+	headers.Insert("Accept", "application/json");
+
+	PostRequestInfo request(url, headers, *params, reinterpret_cast<const_data_ptr_t>(intake_body_json.data()),
+	                        intake_body_json.size());
+	request.try_request = true;
+	auto response = http_util.Request(request);
+
+	if (!response) {
+		throw IOException("Datadog log intake request failed through %s: no response (check the proxy URL and CORS "
+		                  "allowlist)",
+		                  base_url);
+	}
+	if (!response->Success()) {
+		auto status = static_cast<uint16_t>(response->status);
+		if (response->status != HTTPStatusCode::INVALID) {
+			auto detail = BrowserHTTPErrorDetail(*response);
+			if (detail.empty()) {
+				detail = "request rejected without a response body";
+			}
+			throw IOException("Datadog log intake returned HTTP %d through %s: %s", status, base_url, detail);
+		}
+		throw IOException("Datadog log intake request failed through %s: %s (check the proxy URL, CORS allowlist, "
+		                  "and network connection)",
+		                  base_url, response->GetError());
+	}
+	return response->body;
+#else
+	// Intake authenticates with the API key only; the application key is neither required nor used.
+	// Content-Type is supplied by Post()'s content_type argument below — setting it here too would
+	// send a duplicate header that the intake API rejects with HTTP 415.
+	duckdb_httplib_openssl::Headers headers = {
+	    {"DD-API-KEY", api_key},
+	    {"Accept", "application/json"},
+	};
+
+	// One client is shared across all send_datadog_logs projection threads; serialize so concurrent
+	// invocations never use the single intake socket at the same time.
+	std::lock_guard<std::mutex> intake_guard(intake_mutex);
+
+	for (uint64_t attempt = 0;; attempt++) {
+		if (context.interrupted) {
+			throw InterruptException();
+		}
+		auto response = GetIntakeConnection().Post(INTAKE_PATH, headers, intake_body_json, "application/json");
+
+		if (!response) {
+			auto error = response.error();
+			intake_connection.reset();
+			// Only pre-send failures are safe to retry on this non-idempotent write endpoint.
+			if (attempt >= retries || !IsPreSendTransportError(error)) {
+				throw IOException("Datadog log intake request to %s failed: %s", BuildIntakeBaseUrl(site),
+				                  duckdb_httplib_openssl::to_string(error));
+			}
+			SleepCheckingInterrupt(context, MinValue<uint64_t>(uint64_t(1) << attempt, 60));
+			continue;
+		}
+
+		if (response->status == 429 && attempt < retries) {
+			SleepCheckingInterrupt(context, RateLimitRetryDelaySeconds(*response, attempt));
+			continue;
+		}
+		if (response->status >= 500 && attempt < retries) {
+			SleepCheckingInterrupt(context, MinValue<uint64_t>(uint64_t(1) << attempt, 60));
+			continue;
+		}
+		if (response->status < 200 || response->status >= 300) {
+			throw IOException("Datadog log intake returned HTTP %d: %s", response->status, response->body);
+		}
+		return response->body;
+	}
+#endif
 }
 
 } // namespace duckdb

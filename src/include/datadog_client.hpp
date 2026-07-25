@@ -3,6 +3,8 @@
 #include "duckdb.hpp"
 
 #ifndef __EMSCRIPTEN__
+#include <mutex>
+
 //! Forward-declared so the native-only httplib header stays out of this public header. The
 //! namespace name matches cpp-httplib's OpenSSL build selected by CMake.
 namespace duckdb_httplib_openssl {
@@ -39,6 +41,12 @@ struct DatadogClient {
 	DatadogClient();
 	~DatadogClient();
 
+	//! Copy the configuration (not the live connection) into `target`. Centralizes the field list so
+	//! adding a config field does not silently miss a hand-rolled copy at a bind site. DatadogClient
+	//! is intentionally non-copyable because it owns a live socket, so callers that need a configured
+	//! clone (e.g. FunctionData::Copy) default-construct one and call this.
+	void CopyConfigTo(DatadogClient &target) const;
+
 	//! POST `request_body_json` to /api/v2/logs/events/search and return the raw response body.
 	//! Transparently retries transient failures (429 / 5xx / transport errors) up to `retries`
 	//! times, sleeping in small slices so query interrupts (Ctrl+C) cancel the wait promptly.
@@ -52,6 +60,12 @@ struct DatadogClient {
 	//! SearchLogs. Permission failures include guidance about logs_read_config and INDEXES.
 	string ListLogIndexes(ClientContext &context) const;
 
+	//! POST `intake_body_json` (a JSON array of logs) to the log intake API at
+	//! https://http-intake.logs.<site>/api/v2/logs and return the raw response body. Unlike the
+	//! search/config endpoints this host uses only DD-API-KEY (no application key). Shares the same
+	//! retry, backoff, cancellation, and TLS behavior; a successful send returns HTTP 202.
+	string SendLogs(ClientContext &context, const string &intake_body_json) const;
+
 private:
 #ifndef __EMSCRIPTEN__
 	//! Lazily created on first use and reused (HTTP keep-alive) for every later request. Mutable
@@ -60,8 +74,20 @@ private:
 	//! error, since the failure may have left the pooled socket in a broken state.
 	mutable unique_ptr<duckdb_httplib_openssl::Client> connection;
 
+	//! Separate keep-alive connection to the log intake host (http-intake.logs.<site>), which is a
+	//! different origin from the api.<site> host the search/config endpoints use. Lazily created and
+	//! reset on transport error, mirroring `connection`.
+	mutable unique_ptr<duckdb_httplib_openssl::Client> intake_connection;
+
+	//! Serializes SendLogs across threads. Unlike the reader (which forces MaxThreads()==1), the
+	//! send_datadog_logs scalar can run on several projection threads that all share this one client;
+	//! the mutex prevents concurrent use of the single non-thread-safe intake socket.
+	mutable std::mutex intake_mutex;
+
 	//! Return the shared connection, creating and configuring it on the first call.
 	duckdb_httplib_openssl::Client &GetConnection() const;
+	//! Return the shared intake connection, creating and configuring it on the first call.
+	duckdb_httplib_openssl::Client &GetIntakeConnection() const;
 #endif
 
 	//! Perform an authenticated GET or POST. A null body selects GET; otherwise POST JSON.

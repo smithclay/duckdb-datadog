@@ -38,6 +38,15 @@ DD_SITE="${DD_SITE:-datadoghq.com}"
 POLL_TIMEOUT="${POLL_TIMEOUT:-150}"
 POLL_INTERVAL="${POLL_INTERVAL:-10}"
 
+# The extension accepts a full-URL SITE (e.g. https://us5.datadoghq.com) and normalizes it, but the
+# raw curl intake host below needs a bare host. Strip any scheme, trailing slash, and api./app.
+# prefix so both a bare site and a URL-form site work.
+DD_SITE_HOST="${DD_SITE#http://}"
+DD_SITE_HOST="${DD_SITE_HOST#https://}"
+DD_SITE_HOST="${DD_SITE_HOST%/}"
+DD_SITE_HOST="${DD_SITE_HOST#api.}"
+DD_SITE_HOST="${DD_SITE_HOST#app.}"
+
 log()  { printf '\033[1;34m[e2e]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[e2e] PASS\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[e2e] FAIL\033[0m %s\n' "$*" >&2; exit 1; }
@@ -70,7 +79,7 @@ trap cleanup EXIT
 # 1. Send a uniquely-tagged log line via the Datadog log intake API
 # ---------------------------------------------------------------------------
 MARKER="duckdbe2e-$(date +%s)-${RANDOM}"
-INTAKE_URL="https://http-intake.logs.${DD_SITE}/api/v2/logs"
+INTAKE_URL="https://http-intake.logs.${DD_SITE_HOST}/api/v2/logs"
 HOST_NAME="$(hostname)"
 
 # Keep DD-API-KEY off curl's argv (visible in ps) by passing it via a 600-mode config file.
@@ -179,7 +188,51 @@ log "Sample row:"
 printf '%s\n' "${assert_out}" | sed -n '/---SAMPLE---/,$p' | tail -n +2
 
 # ---------------------------------------------------------------------------
-# 4. Independent cross-check via pup (optional)
+# 4. Send a log THROUGH the extension (send_datadog_logs) and read it back
+# ---------------------------------------------------------------------------
+# This exercises the write path: build one OTLP-shaped row in DuckDB, push it to Datadog with the
+# send_datadog_logs() scalar function, then poll read_datadog_logs() until the intake is searchable.
+SEND_MARKER="duckdbsend-$(date +%s)-${RANDOM}"
+SEND_SERVICE="duckdb-datadog-send-e2e"
+SEND_QUERY="service:${SEND_SERVICE} ${SEND_MARKER}"
+
+log "Sending a log via send_datadog_logs() with marker '${SEND_MARKER}'"
+# The OTLP-shaped row mirrors read_datadog_logs' output columns; extra columns would be ignored.
+send_sql=$(cat <<SQL
+CREATE TEMP TABLE to_send AS SELECT
+    now()::TIMESTAMP_NS                                             AS time_unix_nano,
+    '${SEND_SERVICE}'                                               AS service_name,
+    'info'                                                          AS severity_text,
+    9                                                               AS severity_number,
+    'duckdb-datadog send e2e ${SEND_MARKER}'                       AS body,
+    '{"marker":"${SEND_MARKER}","test":"duckdb_datadog_send_e2e"}' AS log_attributes,
+    '{"host":"${HOST_NAME}","ddtags":["test:duckdb_datadog_send_e2e","marker:${SEND_MARKER}"]}' AS resource_attributes;
+SELECT send_datadog_logs(t) FROM to_send t;
+SQL
+)
+send_result="$(run_duckdb_scalar "${send_sql}" 2>/dev/null | tr -d '[:space:]')" || true
+[ "${send_result}" = "ok" ] || fail "send_datadog_logs did not return 'ok' (got '${send_result:-<empty>}')"
+ok "send_datadog_logs accepted the log (returned 'ok')"
+
+log "Polling read_datadog_logs for the sent log (timeout ${POLL_TIMEOUT}s)..."
+send_count_sql="SELECT count(*) FROM read_datadog_logs(query => '${SEND_QUERY}', \"from\" => 'now-15m', \"to\" => 'now');"
+elapsed=0
+send_found=0
+while [ "${elapsed}" -lt "${POLL_TIMEOUT}" ]; do
+	count="$(run_duckdb_scalar "${send_count_sql}" 2>/dev/null | tr -d '[:space:]')" || true
+	if [[ "${count}" =~ ^[0-9]+$ ]] && [ "${count}" -ge 1 ]; then
+		send_found=1
+		break
+	fi
+	log "  not indexed yet (matches=${count:-0}); retrying in ${POLL_INTERVAL}s (${elapsed}/${POLL_TIMEOUT}s)"
+	sleep "${POLL_INTERVAL}"
+	elapsed=$((elapsed + POLL_INTERVAL))
+done
+[ "${send_found}" -eq 1 ] || fail "log sent via send_datadog_logs (marker '${SEND_MARKER}') never became searchable within ${POLL_TIMEOUT}s"
+ok "round-trip through send_datadog_logs succeeded (matches=${count})"
+
+# ---------------------------------------------------------------------------
+# 5. Independent cross-check via pup (optional)
 # ---------------------------------------------------------------------------
 if command -v pup >/dev/null 2>&1; then
 	log "Cross-checking the same log via 'pup logs search'..."

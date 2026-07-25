@@ -32,7 +32,8 @@ include_directories(src/include)
 
 set(EXTENSION_SOURCES src/datadog_extension.cpp src/datadog_secret.cpp
                       src/datadog_client.cpp src/datadog_json.cpp
-                      src/logs_table.cpp src/datadog_catalog.cpp)
+                      src/logs_table.cpp src/datadog_catalog.cpp
+                      src/send_logs.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
@@ -58,7 +59,10 @@ add_executable(datadog_json_test EXCLUDE_FROM_ALL
 target_include_directories(
   datadog_json_test PRIVATE src/include
                              "${DATADOG_DUCKDB_DIR}/third_party/yyjson/include")
-target_link_libraries(datadog_json_test dummy_static_extension_loader duckdb_static)
+# Link order matters for GNU ld: duckdb_static references ExtensionHelper::LoadAllExtensions, which
+# the dummy loader defines, so the loader must follow duckdb_static on the link line (a no-op on
+# order-independent linkers such as Apple ld).
+target_link_libraries(datadog_json_test duckdb_static dummy_static_extension_loader)
 set_target_properties(
   datadog_json_test
   PROPERTIES RUNTIME_OUTPUT_DIRECTORY

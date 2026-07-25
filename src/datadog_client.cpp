@@ -84,6 +84,14 @@ DatadogClient::DatadogClient() = default;
 DatadogClient::~DatadogClient() {
 }
 
+void DatadogClient::CopyConfigTo(DatadogClient &target) const {
+	target.site = site;
+	target.api_key = api_key;
+	target.app_key = app_key;
+	target.timeout_seconds = timeout_seconds;
+	target.retries = retries;
+}
+
 #ifndef __EMSCRIPTEN__
 duckdb_httplib_openssl::Client &DatadogClient::GetConnection() const {
 	if (!connection) {
@@ -118,6 +126,22 @@ static void SleepCheckingInterrupt(ClientContext &context, uint64_t seconds) {
 			throw InterruptException();
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	}
+}
+
+//! Transport errors that are guaranteed to have happened *before* any request bytes reached the
+//! server, so retrying them cannot duplicate a write. The log intake endpoint is not idempotent, so
+//! SendLogs only retries these (a Read/Write/Unknown error may mean the batch was already accepted
+//! and its 202 response was merely lost — retrying that would double-index the logs).
+static bool IsPreSendTransportError(duckdb_httplib_openssl::Error error) {
+	switch (error) {
+	case duckdb_httplib_openssl::Error::Connection:
+	case duckdb_httplib_openssl::Error::ConnectionTimeout:
+	case duckdb_httplib_openssl::Error::BindIPAddress:
+	case duckdb_httplib_openssl::Error::ProxyConnection:
+		return true;
+	default:
+		return false;
 	}
 }
 
@@ -290,7 +314,9 @@ string DatadogClient::SendLogs(ClientContext &context, const string &intake_body
 	auto &http_util = HTTPUtil::Get(*context.db);
 	auto params = http_util.InitializeParameters(context, url);
 	params->timeout = timeout_seconds;
-	params->retries = retries;
+	// The log intake endpoint is not idempotent, so do not let the browser transport blindly retry a
+	// write whose response may have been lost — that would double-index the batch.
+	params->retries = 0;
 	params->keep_alive = true;
 	params->follow_location = false;
 
@@ -332,6 +358,10 @@ string DatadogClient::SendLogs(ClientContext &context, const string &intake_body
 	    {"Accept", "application/json"},
 	};
 
+	// One client is shared across all send_datadog_logs projection threads; serialize so concurrent
+	// invocations never use the single intake socket at the same time.
+	std::lock_guard<std::mutex> intake_guard(intake_mutex);
+
 	for (uint64_t attempt = 0;; attempt++) {
 		if (context.interrupted) {
 			throw InterruptException();
@@ -341,7 +371,8 @@ string DatadogClient::SendLogs(ClientContext &context, const string &intake_body
 		if (!response) {
 			auto error = response.error();
 			intake_connection.reset();
-			if (attempt >= retries || !IsRetryableTransportError(error)) {
+			// Only pre-send failures are safe to retry on this non-idempotent write endpoint.
+			if (attempt >= retries || !IsPreSendTransportError(error)) {
 				throw IOException("Datadog log intake request to %s failed: %s", BuildIntakeBaseUrl(site),
 				                  duckdb_httplib_openssl::to_string(error));
 			}

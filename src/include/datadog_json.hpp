@@ -59,11 +59,21 @@ struct DatadogIntakeLog {
 	string resource_attributes_json; //! JSON object; nested under `resource_attributes`, mined for host/ddtags
 };
 
-//! Build the JSON array body for `POST https://http-intake.logs.<site>/api/v2/logs` from OTLP-shaped
-//! logs. Reserved attributes are set from the matching fields; `hostname`/`ddtags` fall back to
-//! `resource_attributes`; `log_attributes` keys become top-level custom attributes without ever
-//! overwriting an already-set reserved key. Malformed attribute JSON is skipped rather than fatal.
-string BuildDatadogIntakeBody(const vector<DatadogIntakeLog> &logs);
+//! Build the JSON array body for `POST https://http-intake.logs.<site>/api/v2/logs` from `count`
+//! OTLP-shaped logs starting at `logs`. Reserved attributes are set from the matching fields;
+//! `hostname`/`ddtags` fall back to `resource_attributes`; `log_attributes` keys become top-level
+//! custom attributes without ever overwriting an already-set reserved key. Malformed attribute JSON
+//! is skipped rather than fatal. The pointer form lets callers serialize a sub-range (one intake
+//! batch) without copying the logs out of their backing vector.
+string BuildDatadogIntakeBody(const DatadogIntakeLog *logs, idx_t count);
+inline string BuildDatadogIntakeBody(const vector<DatadogIntakeLog> &logs) {
+	return BuildDatadogIntakeBody(logs.data(), logs.size());
+}
+
+//! Approximate serialized byte size of one intake log, used to keep an intake batch under the
+//! Datadog 5 MB request limit. Deliberately an over-estimate (counts raw field bytes plus a fixed
+//! per-log envelope) so batching stays safely below the hard limit.
+idx_t EstimateDatadogIntakeLogBytes(const DatadogIntakeLog &log);
 
 //! Return the next outgoing page limit. A positive max_rows reduces the request to the
 //! unreserved portion of the bounded relation's row budget.

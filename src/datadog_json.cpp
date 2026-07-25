@@ -261,12 +261,22 @@ static void ApplyResourceAttributes(yyjson_mut_doc *doc, yyjson_mut_val *obj, co
 	}
 }
 
-string BuildDatadogIntakeBody(const vector<DatadogIntakeLog> &logs) {
+idx_t EstimateDatadogIntakeLogBytes(const DatadogIntakeLog &log) {
+	// Fixed envelope covers the JSON braces, reserved keys, quotes, and separators; the exact number
+	// does not matter as long as it is a comfortable over-estimate of the non-value overhead.
+	constexpr idx_t PER_LOG_ENVELOPE = 256;
+	return PER_LOG_ENVELOPE + log.message.size() + log.service.size() + log.status.size() + log.hostname.size() +
+	       log.ddsource.size() + log.ddtags.size() + log.trace_id.size() + log.span_id.size() +
+	       log.log_attributes_json.size() + log.resource_attributes_json.size();
+}
+
+string BuildDatadogIntakeBody(const DatadogIntakeLog *logs, idx_t count) {
 	YyjsonMutDocPtr doc(yyjson_mut_doc_new(nullptr));
 	auto arr = yyjson_mut_arr(doc.get());
 	yyjson_mut_doc_set_root(doc.get(), arr);
 
-	for (const auto &log : logs) {
+	for (idx_t i = 0; i < count; i++) {
+		const auto &log = logs[i];
 		auto obj = yyjson_mut_obj(doc.get());
 
 		// Reserved Datadog attributes first, so log_attributes can never clobber them.

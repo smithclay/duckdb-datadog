@@ -170,6 +170,23 @@ int main() {
 		size_t first = multi_body.find("\"message\"");
 		Require(first != string::npos && multi_body.find("\"message\"", first + 1) != string::npos,
 		        "each input log should appear as its own array element");
+
+		// The pointer/count overload serializes a sub-range without copying it out of the vector.
+		vector<DatadogIntakeLog> many = {basic, sparse, with_resource};
+		auto sub_body = BuildDatadogIntakeBody(many.data() + 1, 2); // sparse + with_resource only
+		Require(sub_body.find("web-store") == string::npos, "sub-range must exclude logs before the offset");
+		Require(sub_body.find("host-1") != string::npos, "sub-range must include logs within the range");
+		Require(BuildDatadogIntakeBody(many.data(), 0) == "[]", "a zero-length range is an empty array");
+
+		// The byte estimate grows with payload size and carries a non-zero fixed envelope.
+		DatadogIntakeLog small_est;
+		small_est.message = "x";
+		DatadogIntakeLog big_est;
+		big_est.message = string(10000, 'x');
+		Require(EstimateDatadogIntakeLogBytes(big_est) > EstimateDatadogIntakeLogBytes(small_est) + 9000,
+		        "byte estimate should scale with field sizes");
+		Require(EstimateDatadogIntakeLogBytes(DatadogIntakeLog()) > 0,
+		        "byte estimate should include a fixed per-log envelope");
 	} catch (const std::exception &error) {
 		std::cerr << "datadog_json_test failed: " << error.what() << std::endl;
 		return 1;

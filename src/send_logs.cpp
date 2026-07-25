@@ -21,6 +21,10 @@ namespace duckdb {
 //! The log intake API accepts at most 1000 logs per request; larger chunks are split into batches.
 static constexpr idx_t DATADOG_INTAKE_MAX_BATCH = 1000;
 
+//! ...and at most 5 MB (uncompressed) per request. Cap batches at 4 MB of estimated payload so the
+//! serialized body, plus estimation slack, stays comfortably under the hard limit.
+static constexpr idx_t DATADOG_INTAKE_MAX_BATCH_BYTES = 4 * 1024 * 1024;
+
 //! Index of each recognized OTLP struct field within the argument struct, or -1 when the input
 //! struct does not carry that field. Resolved once at bind time from the struct's child names.
 struct SendLogsFieldIndices {
@@ -37,6 +41,18 @@ struct SendLogsFieldIndices {
 	int32_t ddtags = -1;              // ddtags -> `ddtags`
 	int32_t resource_attributes = -1; // resource_attributes (JSON) -> host/ddtags + nested block
 	int32_t log_attributes = -1;      // log_attributes (JSON) -> merged top-level attributes
+	//! Unit of an integer-typed timestamp column: true when the matched column is
+	//! time_unix_nano (epoch nanoseconds), false when it is `timestamp` (epoch milliseconds).
+	//! Temporal-typed columns are converted precisely regardless of this flag.
+	bool timestamp_is_nanos = false;
+
+	bool operator==(const SendLogsFieldIndices &o) const {
+		return message == o.message && service == o.service && status == o.status &&
+		       severity_number == o.severity_number && hostname == o.hostname && ddsource == o.ddsource &&
+		       timestamp == o.timestamp && observed_timestamp == o.observed_timestamp && trace_id == o.trace_id &&
+		       span_id == o.span_id && ddtags == o.ddtags && resource_attributes == o.resource_attributes &&
+		       log_attributes == o.log_attributes && timestamp_is_nanos == o.timestamp_is_nanos;
+	}
 };
 
 struct DatadogSendLogsBindData : public FunctionData {
@@ -46,16 +62,12 @@ struct DatadogSendLogsBindData : public FunctionData {
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<DatadogSendLogsBindData>();
 		result->fields = fields;
-		result->client.site = client.site;
-		result->client.api_key = client.api_key;
-		result->client.app_key = client.app_key;
-		result->client.retries = client.retries;
-		result->client.timeout_seconds = client.timeout_seconds;
+		client.CopyConfigTo(result->client);
 		return std::move(result);
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<DatadogSendLogsBindData>();
-		return client.site == other.client.site && client.api_key == other.client.api_key &&
+		return fields == other.fields && client.site == other.client.site && client.api_key == other.client.api_key &&
 		       client.app_key == other.client.app_key;
 	}
 };
@@ -119,6 +131,9 @@ static unique_ptr<FunctionData> DatadogSendLogsBind(ClientContext &context, Scal
 	fields.hostname = PickField(by_name, {"hostname", "host"});
 	fields.ddsource = PickField(by_name, {"ddsource"});
 	fields.timestamp = PickField(by_name, {"time_unix_nano", "timestamp"});
+	// PickField prefers time_unix_nano; if that is the column, an integer value is epoch nanoseconds,
+	// otherwise (`timestamp`) it is epoch milliseconds. Temporal-typed values ignore this flag.
+	fields.timestamp_is_nanos = by_name.count("time_unix_nano") > 0;
 	fields.observed_timestamp = PickField(by_name, {"observed_time_unix_nano"});
 	fields.trace_id = PickField(by_name, {"trace_id"});
 	fields.span_id = PickField(by_name, {"span_id"});
@@ -159,15 +174,29 @@ static string ReadStringField(vector<unique_ptr<Vector>> &children, int32_t inde
 	return value.ToString();
 }
 
-//! Read a struct child as epoch milliseconds. Accepts any DuckDB timestamp/date type by casting to
-//! nanosecond precision. Returns false when the field is absent, NULL, or not time-convertible.
-static bool ReadTimestampMs(vector<unique_ptr<Vector>> &children, int32_t index, idx_t row, int64_t &out_ms) {
+//! Read a struct child as epoch milliseconds. Temporal (TIMESTAMP*/DATE/VARCHAR) values are cast to
+//! nanosecond precision and reduced to ms. Integer values are taken as a raw epoch: nanoseconds when
+//! `is_nanos` (an OTLP time_unix_nano column), milliseconds otherwise. Returns false when the field
+//! is absent, NULL, or not convertible.
+static bool ReadTimestampMs(vector<unique_ptr<Vector>> &children, int32_t index, bool is_nanos, idx_t row,
+                            int64_t &out_ms) {
 	if (index < 0) {
 		return false;
 	}
 	auto value = children[index]->GetValue(row);
 	if (value.IsNull()) {
 		return false;
+	}
+	// A bare integer column carries a raw epoch value; a TIMESTAMP_NS cast would fail and silently
+	// drop it, so interpret it directly using the column's unit.
+	if (value.type().IsIntegral()) {
+		Value as_big;
+		if (!value.DefaultTryCastAs(LogicalType::BIGINT, as_big, nullptr) || as_big.IsNull()) {
+			return false;
+		}
+		int64_t raw = as_big.GetValue<int64_t>();
+		out_ms = is_nanos ? raw / 1000000 : raw; // ns -> ms, or already ms
+		return true;
 	}
 	Value nanos;
 	if (!value.DefaultTryCastAs(LogicalType::TIMESTAMP_NS, nanos, nullptr) || nanos.IsNull()) {
@@ -206,8 +235,9 @@ static DatadogIntakeLog BuildIntakeLogFromRow(const SendLogsFieldIndices &fields
 	}
 
 	int64_t timestamp_ms;
-	if (ReadTimestampMs(children, fields.timestamp, row, timestamp_ms) ||
-	    ReadTimestampMs(children, fields.observed_timestamp, row, timestamp_ms)) {
+	// observed_time_unix_nano is always OTLP nanoseconds; the primary column's unit was resolved at bind.
+	if (ReadTimestampMs(children, fields.timestamp, fields.timestamp_is_nanos, row, timestamp_ms) ||
+	    ReadTimestampMs(children, fields.observed_timestamp, /*is_nanos=*/true, row, timestamp_ms)) {
 		log.has_timestamp_ms = true;
 		log.timestamp_ms = timestamp_ms;
 	}
@@ -243,15 +273,27 @@ static void DatadogSendLogsFunction(DataChunk &args, ExpressionState &state, Vec
 		source_rows.push_back(row);
 	}
 
-	// Send in batches of at most DATADOG_INTAKE_MAX_BATCH logs each.
-	for (idx_t offset = 0; offset < logs.size(); offset += DATADOG_INTAKE_MAX_BATCH) {
-		idx_t batch_end = MinValue<idx_t>(offset + DATADOG_INTAKE_MAX_BATCH, logs.size());
-		vector<DatadogIntakeLog> batch(logs.begin() + offset, logs.begin() + batch_end);
-		string body = BuildDatadogIntakeBody(batch);
+	// Send in batches bounded by BOTH the Datadog per-request log count (1000) and the ~5 MB payload
+	// limit. Each batch is a contiguous [offset, batch_end) sub-range of `logs`, serialized in place
+	// (no copy). A single log larger than the byte cap is still sent alone rather than merged.
+	idx_t offset = 0;
+	while (offset < logs.size()) {
+		idx_t batch_end = offset;
+		idx_t batch_bytes = 0;
+		while (batch_end < logs.size() && (batch_end - offset) < DATADOG_INTAKE_MAX_BATCH) {
+			idx_t next_bytes = EstimateDatadogIntakeLogBytes(logs[batch_end]);
+			if (batch_end > offset && batch_bytes + next_bytes > DATADOG_INTAKE_MAX_BATCH_BYTES) {
+				break; // adding this log would exceed the payload cap; flush what we have
+			}
+			batch_bytes += next_bytes;
+			batch_end++;
+		}
+		string body = BuildDatadogIntakeBody(logs.data() + offset, batch_end - offset);
 		bind.client.SendLogs(context, body); // throws on non-2xx / exhausted retries
 		for (idx_t i = offset; i < batch_end; i++) {
 			result.SetValue(source_rows[i], Value("ok"));
 		}
+		offset = batch_end;
 	}
 }
 

@@ -216,18 +216,31 @@ are simply omitted:
 | `hostname` / `host`                             | `hostname` (falls back to `resource_attributes.host`) |
 | `ddsource`                                       | `ddsource` (defaults to `duckdb`)                 |
 | `time_unix_nano` / `timestamp`                  | `timestamp` (epoch ms; `observed_time_unix_nano` fallback) |
+| `severity_number`                               | `status` (only when no severity/status column is present) |
 | `ddtags`                                        | `ddtags` (falls back to `resource_attributes.ddtags`) |
 | `trace_id`, `span_id`                           | custom attributes                                 |
 | `resource_attributes` (JSON)                    | nested `resource_attributes`, mined for host/tags |
 | `log_attributes` (JSON object)                  | merged as top-level custom attributes             |
 
 Notes:
-- Rows are batched into intake requests of up to 1000 logs each; the function shares the reader's
-  retry, backoff, and cancellation behavior. A failed request raises an error.
+- Rows are batched into intake requests bounded by Datadog's limits (≤1000 logs and ≤5 MB per
+  request); each batch is one HTTP POST. Cancellation (Ctrl+C) is honored between batches.
+- The intake endpoint is **not idempotent**, so sends are retried only on failures that provably
+  occurred before any data reached Datadog (connection setup) and on rate limits (`429`); a response
+  lost after the batch may have been accepted is surfaced as an error rather than silently re-sent
+  and double-indexed.
+- Because a large input is sent as several independent requests, a failure partway through leaves
+  earlier batches already delivered. The statement raises an error and returns no rows, but the
+  already-sent logs remain in Datadog — re-running may duplicate them. For all-or-nothing semantics,
+  send in a single batch (≤1000 rows, ≤5 MB).
+- The timestamp column may be a `TIMESTAMP`/`TIMESTAMP_NS`/`DATE` (converted precisely) or a bare
+  integer epoch — nanoseconds for `time_unix_nano`, milliseconds for a `timestamp` column.
 - `log_attributes` keys never overwrite a reserved attribute already set from another column.
 - Datadog drops logs whose `timestamp` is more than ~18h in the past; when replaying old data,
   either omit the timestamp column or expect those logs not to be indexed.
 - A `NULL` log struct maps to a `NULL` result and is not sent.
+- Concurrency-safe: the function may run on multiple threads, and sends to the shared connection are
+  serialized internally.
 
 ## Building
 

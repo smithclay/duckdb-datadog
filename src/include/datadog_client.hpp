@@ -3,6 +3,8 @@
 #include "duckdb.hpp"
 
 #ifndef __EMSCRIPTEN__
+#include <mutex>
+
 //! Forward-declared so the native-only httplib header stays out of this public header. The
 //! namespace name matches cpp-httplib's OpenSSL build selected by CMake.
 namespace duckdb_httplib_openssl {
@@ -39,6 +41,12 @@ struct DatadogClient {
 	DatadogClient();
 	~DatadogClient();
 
+	//! Copy the configuration (not the live connection) into `target`. Centralizes the field list so
+	//! adding a config field does not silently miss a hand-rolled copy at a bind site. DatadogClient
+	//! is intentionally non-copyable because it owns a live socket, so callers that need a configured
+	//! clone (e.g. FunctionData::Copy) default-construct one and call this.
+	void CopyConfigTo(DatadogClient &target) const;
+
 	//! POST `request_body_json` to /api/v2/logs/events/search and return the raw response body.
 	//! Transparently retries transient failures (429 / 5xx / transport errors) up to `retries`
 	//! times, sleeping in small slices so query interrupts (Ctrl+C) cancel the wait promptly.
@@ -70,6 +78,11 @@ private:
 	//! different origin from the api.<site> host the search/config endpoints use. Lazily created and
 	//! reset on transport error, mirroring `connection`.
 	mutable unique_ptr<duckdb_httplib_openssl::Client> intake_connection;
+
+	//! Serializes SendLogs across threads. Unlike the reader (which forces MaxThreads()==1), the
+	//! send_datadog_logs scalar can run on several projection threads that all share this one client;
+	//! the mutex prevents concurrent use of the single non-thread-safe intake socket.
+	mutable std::mutex intake_mutex;
 
 	//! Return the shared connection, creating and configuring it on the first call.
 	duckdb_httplib_openssl::Client &GetConnection() const;

@@ -21,7 +21,7 @@ static constexpr idx_t COL_STATUS = 4;
 static constexpr idx_t COL_LAST_TRIGGERED_AT = 5;
 static constexpr idx_t COL_LAST_NODATA_AT = 6;
 static constexpr idx_t COLUMN_COUNT = 7;
-static constexpr int64_t PAGE_SIZE = 100;
+static constexpr int64_t ALERTS_PAGE_SIZE = 100;
 
 struct DatadogOpenAlertsBindData : public TableFunctionData {
 	TableCatalogEntry *table = nullptr;
@@ -101,7 +101,7 @@ static void MapOpenAlert(const DatadogOpenAlertGroup &group, const vector<column
 
 static void FetchNextPage(ClientContext &context, const DatadogOpenAlertsBindData &bind,
                           DatadogOpenAlertsGlobalState &state) {
-	auto response = bind.client.SearchOpenAlerts(context, state.page, PAGE_SIZE);
+	auto response = bind.client.SearchOpenAlerts(context, state.page, ALERTS_PAGE_SIZE);
 	auto page = ParseDatadogOpenAlertsPage(response);
 	state.page++;
 	state.api_rows_received += page.groups.size();
@@ -119,7 +119,7 @@ static void FetchNextPage(ClientContext &context, const DatadogOpenAlertsBindDat
 
 	if (page.groups.empty() ||
 	    (page.has_total_count && state.api_rows_received >= static_cast<idx_t>(page.total_count)) ||
-	    (!page.has_total_count && page.groups.size() < static_cast<idx_t>(PAGE_SIZE))) {
+	    (!page.has_total_count && page.groups.size() < static_cast<idx_t>(ALERTS_PAGE_SIZE))) {
 		state.finished = true;
 	}
 }
@@ -162,7 +162,7 @@ static InsertionOrderPreservingMap<string> DatadogOpenAlertsToString(TableFuncti
 	auto &bind = input.bind_data->Cast<DatadogOpenAlertsBindData>();
 	result["Function"] = input.table_function.name;
 	result["Datadog Alert States"] = "Alert, Warn, No Data";
-	result["Datadog Page Size"] = std::to_string(PAGE_SIZE);
+	result["Datadog Page Size"] = std::to_string(ALERTS_PAGE_SIZE);
 	result["Datadog Retries"] = std::to_string(bind.client.retries);
 	result["Datadog Timeout"] = std::to_string(bind.client.timeout_seconds);
 	return result;

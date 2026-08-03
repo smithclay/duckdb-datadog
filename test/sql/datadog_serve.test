@@ -1,0 +1,45 @@
+# name: test/sql/datadog_serve.test
+# description: test the native Datadog live-ingest server lifecycle
+# group: [sql]
+
+require datadog
+
+# Native sockets and worker threads are not available in wasm32 builds.
+require 64bit
+
+query T
+SELECT datadog_serve('datadog:127.0.0.1:55519', {table_name: 'received_datadog_logs'});
+----
+http://127.0.0.1:55519/api/v2/logs
+
+# Starting the same listener with the same options is idempotent.
+query T
+SELECT datadog_serve('datadog:127.0.0.1:55519', {table_name: 'received_datadog_logs'});
+----
+http://127.0.0.1:55519/api/v2/logs
+
+query I
+SELECT count(*) FROM (DESCRIBE received_datadog_logs);
+----
+18
+
+query T
+SELECT datadog_stop('datadog:127.0.0.1:55519');
+----
+stopped
+
+query T
+SELECT datadog_stop('datadog:127.0.0.1:55519');
+----
+not found
+
+# A string second argument is the ergonomic API-key shorthand.
+query T
+SELECT datadog_serve('datadog:127.0.0.1:55519', 'local-agent-key');
+----
+http://127.0.0.1:55519/api/v2/logs
+
+query T
+SELECT datadog_stop('datadog:127.0.0.1:55519');
+----
+stopped

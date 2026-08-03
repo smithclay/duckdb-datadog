@@ -28,6 +28,40 @@ int main() {
 		}
 		Require(malformed_rejected, "malformed discovered index names should be rejected");
 
+		Require(BuildDatadogOpenAlertsPath(3, 100) ==
+		            "/api/v1/monitor/groups/search?query="
+		            "group_status%3A%28Alert%20OR%20Warn%20OR%20%22No%20Data%22%29&page=3&per_page=100",
+		        "open-alert search should use the triggered monitor-group states and requested page");
+		auto alerts = ParseDatadogOpenAlertsPage(R"({
+			"groups":[
+				{"group":"host:web01,env:prod","group_tags":["host:web01","env:prod"],
+				 "last_nodata_ts":0,"last_triggered_ts":1525702966,"monitor_id":2738266,
+				 "monitor_name":"Disk usage is high","status":"Alert"},
+				{"group":"*","group_tags":[],"last_triggered_ts":null,"monitor_id":1576648,
+				 "monitor_name":"Service missing","status":"No Data"}
+			],
+			"metadata":{"page":0,"page_count":2,"per_page":100,"total_count":2}
+		})");
+		Require(alerts.groups.size() == 2, "open-alert response should return every monitor group");
+		Require(alerts.has_total_count && alerts.total_count == 2,
+		        "open-alert response should retain pagination total_count");
+		Require(alerts.groups[0].has_monitor_id && alerts.groups[0].monitor_id == 2738266,
+		        "open-alert monitor id should be parsed");
+		Require(alerts.groups[0].has_group_tags && alerts.groups[0].group_tags.size() == 2,
+		        "open-alert group tags should be parsed as a list");
+		Require(alerts.groups[0].has_last_nodata_ts && alerts.groups[0].last_nodata_ts == 0,
+		        "zero-valued Datadog timestamp sentinels should remain distinguishable from missing fields");
+		Require(!alerts.groups[1].has_last_triggered_ts,
+		        "null open-alert timestamps should preserve SQL NULL semantics");
+
+		malformed_rejected = false;
+		try {
+			ParseDatadogOpenAlertsPage(R"({"groups":[{"group_tags":[null]}]})");
+		} catch (const IOException &) {
+			malformed_rejected = true;
+		}
+		Require(malformed_rejected, "malformed open-alert group tags should be rejected");
+
 		auto bound = BuildDatadogLogsSearchBody("*", "now-15m", "now", "timestamp", 1000, "", {"main"});
 		Require(bound.find("\"indexes\":[\"main\"]") != string::npos,
 		        "catalog search body should contain exactly its bound index");

@@ -4,6 +4,7 @@
 
 #include "datadog_catalog.hpp"
 #include "datadog_secret.hpp"
+#include "datadog_server.hpp"
 #include "logs_table.hpp"
 #include "send_logs.hpp"
 
@@ -21,6 +22,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RegisterDatadogLogsFunction(loader);
 	// Sender: SELECT send_datadog_logs(l) FROM logs l.
 	RegisterDatadogSendLogsFunction(loader);
+	// Native live intake: SELECT datadog_serve([uri [, options_struct]]).
+	RegisterDatadogServerState(loader);
+	RegisterDatadogServerFunctions(loader);
 }
 
 void DatadogExtension::Load(ExtensionLoader &loader) {

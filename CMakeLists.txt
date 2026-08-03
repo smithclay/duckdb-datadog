@@ -9,6 +9,7 @@ set(TARGET_NAME datadog)
 # both builds.
 if(NOT EMSCRIPTEN)
   find_package(OpenSSL REQUIRED)
+  find_package(ZLIB REQUIRED)
 endif()
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
@@ -33,7 +34,7 @@ include_directories(src/include)
 set(EXTENSION_SOURCES src/datadog_extension.cpp src/datadog_secret.cpp
                       src/datadog_client.cpp src/datadog_json.cpp
                       src/logs_table.cpp src/datadog_catalog.cpp
-                      src/send_logs.cpp)
+                      src/send_logs.cpp src/datadog_server.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
@@ -46,7 +47,9 @@ foreach(target ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
                                "${DATADOG_DUCKDB_DIR}/third_party/httplib")
     # Select cpp-httplib's OpenSSL-enabled (and separately-namespaced) build.
     target_compile_definitions(${target} PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
-    target_link_libraries(${target} OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(${target} PRIVATE CPPHTTPLIB_ZLIB_SUPPORT)
+    target_link_libraries(${target} OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB
+                                    duckdb_zstd)
   endif()
 endforeach()
 

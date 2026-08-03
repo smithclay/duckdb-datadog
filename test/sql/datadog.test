@@ -22,6 +22,35 @@ SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'send_datadog
 ----
 true
 
+# The native Datadog live-ingest lifecycle functions are registered.
+query II
+SELECT count(*) FILTER (WHERE function_name = 'datadog_serve') >= 1,
+       count(*) FILTER (WHERE function_name = 'datadog_stop') >= 1
+FROM duckdb_functions();
+----
+true	true
+
+# Server arguments are validated before a socket is opened.
+statement error
+SELECT datadog_serve('http://127.0.0.1:10518');
+----
+expected 'datadog:host[:port]'
+
+statement error
+SELECT datadog_serve('datadog:127.0.0.1:10518', {unknown_option: true});
+----
+Unsupported datadog_serve option 'unknown_option'
+
+statement error
+SELECT datadog_serve('datadog:127.0.0.1:10518', {schema_name: 'main', schema: 'main'});
+----
+are aliases; use only one
+
+statement error
+SELECT datadog_serve('datadog:127.0.0.1:10518', '');
+----
+API key must not be empty
+
 # Calling it without any datadog secret gives a helpful error (this only binds; no network call).
 statement error
 SELECT * FROM read_datadog_logs(query => '*', "from" => 'now-15m', "to" => 'now');

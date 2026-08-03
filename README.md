@@ -6,7 +6,8 @@ directly into DuckDB tables, and sends OTLP-shaped log tables back to Datadog th
 [duckdb-otlp](https://github.com/smithclay/otlp2records) `read_otlp_logs` schema, so Datadog logs
 drop straight into an OTLP-shaped lakehouse alongside data from other sources.
 
-Reading and sending logs are supported today; traces/spans and metrics are planned. See
+Reading, receiving, and sending logs are supported today; traces/spans and metrics are planned.
+See [Receiving logs](#receiving-logs) for the native `datadog_serve` intake server and
 [Sending logs](#sending-logs) for the `send_datadog_logs` scalar function.
 
 ## Quick start
@@ -181,6 +182,81 @@ JSON — Datadog custom attributes); `dropped_attributes_count`, `flags` (INTEGE
 Because attribute columns are JSON strings, query them with DuckDB's JSON functions, e.g.
 `SELECT log_attributes->>'$.http.status_code' FROM logs`.
 
+## Receiving logs
+
+`datadog_serve` starts a native HTTP server inside DuckDB and returns its Datadog v2 intake URL.
+It accepts JSON arrays, single-object JSON, and newline-delimited JSON at `/api/v2/logs` (with
+the legacy `/v1/input` and `/api/v1/logs` paths as aliases). Gzip- and zstd-compressed request
+bodies are supported. Accepted rows are committed synchronously to `main.datadog_logs`, using the same
+18-column OTLP-shaped schema as `read_datadog_logs`:
+
+```sql
+LOAD datadog;
+
+SELECT datadog_serve();
+-- http://localhost:10518/api/v2/logs
+
+SELECT time_unix_nano, service_name, severity_text, body
+FROM datadog_logs;
+
+SELECT datadog_stop();
+```
+
+The optional first argument is a `datadog:` listen URI. For an authenticated listener, the common
+case is just the URI and API key:
+
+```sql
+SELECT datadog_serve('datadog:0.0.0.0:10518', 'local-agent-key');
+```
+
+The API-key shorthand permits a non-loopback bind because the resulting listener is authenticated.
+For advanced configuration, pass an options struct instead:
+
+```sql
+SELECT datadog_serve(
+    'datadog:127.0.0.1:10518',
+    {
+        schema_name: 'main',
+        table_name: 'incoming_logs',
+        api_key: 'local-agent-key',
+        max_body_bytes: 5242880,
+        http_threads: 8
+    }
+);
+```
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `schema_name` | `main` | Target schema (`schema` is retained as an alias). |
+| `table_name` | `datadog_logs` | Target table (`table` is retained as an alias). |
+| `create_table` | `true` | Create the target table if needed; otherwise validate an existing table. |
+| `api_key` | empty | When set, require the same value in `DD-API-KEY`. Empty accepts any key. |
+| `secret` | unset | Read the API key from a named `datadog` secret; mutually exclusive with `api_key`. |
+| `allow_other_hostname` | `false` | Permit non-loopback binds such as `0.0.0.0`. |
+| `max_body_bytes` | 5 MiB | Maximum request-body size. |
+| `http_threads` | auto | HTTP worker count. |
+
+The default and advanced struct form are deliberately loopback-only. Set
+`allow_other_hostname: true` in the struct to receive from another host or container, and use
+`api_key` or `secret` whenever the listener is reachable by another machine. The listener remains
+alive until `datadog_stop(uri)` is called or the owning DuckDB database closes. `datadog_stop`
+returns `stopped` or `not found`.
+
+To point a local Datadog Agent at the default listener, force its HTTP transport and disable TLS
+only for this loopback hop:
+
+```yaml
+logs_enabled: true
+logs_config:
+  force_use_http: true
+  logs_dd_url: "127.0.0.1:10518"
+  logs_no_ssl: true
+```
+
+The Agent sends its configured Datadog API key in `DD-API-KEY`. Pass the same value through
+`api_key`, or use `secret` to read it from an existing Datadog secret. Keep `logs_no_ssl` limited
+to a local or otherwise trusted connection.
+
 ## Sending logs
 
 `send_datadog_logs` pushes an OTLP-shaped log table into a Datadog account through the
@@ -244,8 +320,8 @@ Notes:
 
 ## Building
 
-Native dependencies are minimal: only OpenSSL (via vcpkg). HTTP (cpp-httplib) and JSON (yyjson)
-reuse the copies DuckDB already bundles, so nothing extra is pulled in.
+Native dependencies are minimal: OpenSSL and zlib (via vcpkg). HTTP (cpp-httplib) and JSON (yyjson)
+reuse the copies DuckDB already bundles.
 
 ```shell
 # vcpkg provides OpenSSL
@@ -280,6 +356,18 @@ type (including credential redaction), function registration, and the output sch
 are fully offline (no network).
 
 ### End-to-end test
+
+For a completely local receiving-path test, `run_serve_agent.sh` starts `datadog_serve`, launches a
+real Datadog Agent container with a temporary file-log source, and verifies that the Agent-forwarded
+row lands in DuckDB. It needs Docker but no Datadog account or credentials:
+
+```shell
+make release
+test/e2e/run_serve_agent.sh
+```
+
+Set `DD_AGENT_IMAGE`, `DUCKDB_BIN`, `DATADOG_SERVE_E2E_PORT`, or `POLL_TIMEOUT` to override the
+script defaults. The temporary container, database, configuration, and logs are removed on exit.
 
 `test/e2e/run_e2e.sh` exercises the full round-trip against a real Datadog account. It sends a
 uniquely-tagged log via the log intake API and reads it back through `read_datadog_logs` (asserting

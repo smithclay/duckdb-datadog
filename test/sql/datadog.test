@@ -16,6 +16,13 @@ SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'read_datadog
 ----
 true
 
+# The service-dependency reader is registered.
+query I
+SELECT count(*) >= 1 FROM duckdb_functions()
+WHERE function_name = 'read_datadog_service_dependencies';
+----
+true
+
 # The sender is registered.
 query I
 SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'send_datadog_logs';
@@ -56,6 +63,12 @@ statement error
 SELECT * FROM read_datadog_logs(query => '*', "from" => 'now-15m', "to" => 'now');
 ----
 No 'datadog' secret found
+
+# The service map requires an explicit environment before credentials are resolved.
+statement error
+DESCRIBE SELECT * FROM read_datadog_service_dependencies();
+----
+environment must not be empty
 
 # send_datadog_logs resolves credentials at bind time, so without a secret binding already fails
 # (DESCRIBE binds without executing, so no log is actually sent).
@@ -112,6 +125,57 @@ WHERE column_name IN ('time_unix_nano', 'observed_time_unix_nano', 'trace_id', '
                       'severity_text', 'body', 'resource_attributes', 'log_attributes', 'flags');
 ----
 10
+
+# Service dependencies expose the canonical directed-edge schema (bind only; no API call).
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_datadog_service_dependencies(env => 'prod'));
+----
+17
+
+query II
+SELECT column_name, column_type
+FROM (DESCRIBE SELECT * FROM read_datadog_service_dependencies(env => 'prod'));
+----
+provider	VARCHAR
+source_service	VARCHAR
+target_service	VARCHAR
+source_type	VARCHAR
+target_type	VARCHAR
+edge_type	VARCHAR
+environment	VARCHAR
+window_start	TIMESTAMP_NS
+window_end	TIMESTAMP_NS
+request_count	BIGINT
+error_count	BIGINT
+fault_count	BIGINT
+throttle_count	BIGINT
+total_response_time_seconds	DOUBLE
+source_attributes	VARCHAR
+target_attributes	VARCHAR
+edge_attributes	VARCHAR
+
+statement error
+DESCRIBE SELECT * FROM read_datadog_service_dependencies(env => '');
+----
+environment must not be empty
+
+statement error
+DESCRIBE SELECT * FROM read_datadog_service_dependencies(env => 'prod', retries => -1);
+----
+retries must be >= 0
+
+statement error
+DESCRIBE SELECT * FROM read_datadog_service_dependencies(env => 'prod', timeout => 0);
+----
+timeout must be >= 1
+
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM read_datadog_service_dependencies(
+    env => 'prod', "from" => '-15m', "to" => 'now', primary_tag => 'region:us-west-2',
+    retries => 0, timeout => 15
+);
+----
+physical_plan	<REGEX>:.*"Datadog Environment": "prod".*"Datadog From": "-15m".*"Datadog To": "now".*"Datadog Primary Tag": "region:us-west-2".*"Datadog Retries": "0".*"Datadog Timeout": "15".*
 
 # With a secret present, send_datadog_logs binds to a VARCHAR result for any struct shape. Extra
 # columns are ignored and missing OTLP columns are tolerated (bind only; no log is sent).
@@ -197,6 +261,30 @@ query I
 SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'dd' AND schema_name = 'alerts';
 ----
 1
+
+# The service-map catalog surface exists even when this backward-compatible attachment omitted
+# SERVICE_MAP_ENV.
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'dd' AND schema_name = 'service_map';
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name = 'dd' AND schema_name = 'service_map' AND table_name = 'dependencies';
+----
+1
+
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM dd.service_map.dependencies);
+----
+17
+
+# The focused configuration error occurs only when the lazy table is executed.
+statement error
+SELECT * FROM dd.service_map.dependencies;
+----
+SERVICE_MAP_ENV
 
 query I
 SELECT count(*) FROM duckdb_tables()
@@ -297,7 +385,11 @@ ATTACH 'datadog:' AS dd_bounded (
     PAGE_SIZE 100,
     MAX_ROWS 100,
     RETRIES 0,
-    TIMEOUT 15
+    TIMEOUT 15,
+    SERVICE_MAP_ENV 'prod',
+    SERVICE_MAP_START_TIME '-15m',
+    SERVICE_MAP_END_TIME 'now',
+    SERVICE_MAP_PRIMARY_TAG 'region:us-west-2'
 );
 
 query II
@@ -309,6 +401,25 @@ query II
 EXPLAIN (FORMAT JSON) SELECT * FROM dd_bounded.alerts.open;
 ----
 physical_plan	<REGEX>:.*"Datadog Alert States": "Alert, Warn, No Data".*"Datadog Retries": "0".*"Datadog Timeout": "15".*
+
+# Catalog and function use the same scanner schema; planning remains network-free and retains
+# relative windows verbatim until scan initialization.
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM dd_bounded.service_map.dependencies;
+----
+physical_plan	<REGEX>:.*"Datadog Environment": "prod".*"Datadog From": "-15m".*"Datadog To": "now".*"Datadog Primary Tag": "region:us-west-2".*"Datadog Retries": "0".*"Datadog Timeout": "15".*
+
+query I
+SELECT count(*)
+FROM (
+    (SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM dd_bounded.service_map.dependencies))
+    EXCEPT ALL
+    (SELECT column_name, column_type FROM (
+        DESCRIBE SELECT * FROM read_datadog_service_dependencies(env => 'prod')
+    ))
+);
+----
+0
 
 # MAX_ROWS caps the source relation before SQL WHERE evaluation, including for catalog scans.
 # The remote query must therefore remain '*' and DuckDB retains the residual filter.
@@ -376,6 +487,11 @@ read-only
 
 statement error
 DROP TABLE dd.alerts.open;
+----
+read-only
+
+statement error
+DROP TABLE dd.service_map.dependencies;
 ----
 read-only
 

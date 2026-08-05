@@ -305,6 +305,13 @@ string DatadogClient::SearchOpenAlerts(ClientContext &context, int64_t page, int
 	return AuthenticatedRequest(context, path, nullptr, false);
 }
 
+string DatadogClient::GetServiceDependencies(ClientContext &context, const string &environment,
+                                             const string &primary_tag, int64_t start_epoch_seconds,
+                                             int64_t end_epoch_seconds) const {
+	auto path = BuildDatadogServiceDependenciesPath(environment, primary_tag, start_epoch_seconds, end_epoch_seconds);
+	return AuthenticatedRequest(context, path, nullptr, false);
+}
+
 string DatadogClient::ListLogIndexes(ClientContext &context) const {
 	return AuthenticatedRequest(context, "/api/v1/logs/config/indexes", nullptr, true);
 }

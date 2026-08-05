@@ -1,12 +1,14 @@
 # duckdb-datadog
 
-A DuckDB extension that reads logs and open monitor alerts from Datadog directly into DuckDB,
-receives logs through a native intake server, and sends OTLP-shaped log tables back to Datadog.
+A DuckDB extension that reads logs, open monitor alerts, and APM service dependencies from Datadog
+directly into DuckDB, receives logs through a native intake server, and sends OTLP-shaped log
+tables back to Datadog.
 Log rows conform to the [duckdb-otlp](https://github.com/smithclay/otlp2records)
 `read_otlp_logs` schema, so Datadog logs drop straight into an OTLP-shaped lakehouse alongside
 data from other sources.
 
-Reading, receiving, and sending logs and reading open monitor alerts are supported today;
+Reading, receiving, and sending logs, reading open monitor alerts, and querying service maps are
+supported today;
 traces/spans and metrics are planned.
 See [Receiving logs](#receiving-logs) for the native `datadog_serve` intake server and
 [Sending logs](#sending-logs) for the `send_datadog_logs` scalar function.
@@ -53,7 +55,8 @@ CREATE SECRET dd_prod (
 
 ATTACH 'datadog:' AS dd (
     TYPE datadog,
-    SECRET 'dd_prod'
+    SECRET 'dd_prod',
+    SERVICE_MAP_ENV 'prod'
 );
 
 SELECT * FROM dd.logs.main LIMIT 10;
@@ -63,6 +66,9 @@ SELECT * FROM dd.logs."security-events" LIMIT 10;
 
 -- One row per currently triggered monitor group.
 SELECT * FROM dd.alerts.open ORDER BY last_triggered_at DESC;
+
+-- One row per directed caller -> callee edge from the latest hour.
+SELECT * FROM dd.service_map.dependencies;
 ```
 
 Without `INDEXES`, `ATTACH` calls Datadog's log-index configuration endpoint once and caches the
@@ -107,6 +113,56 @@ The alert table is fetched lazily when scanned and paginates through the Monitor
 It requires the `monitors_read` application-key permission. `RETRIES` and `TIMEOUT` from `ATTACH`
 apply to alert requests as well as log requests. Datadog reports a zero timestamp when a group has
 never entered a state; the table exposes those sentinel values as SQL `NULL`.
+
+### Service maps
+
+`dd.service_map.dependencies` exposes Datadog's APM dependency graph as directed edges. Configure
+its scope on the attachment; the default window is `-1h` through `now`:
+
+```sql
+ATTACH 'datadog:' AS dd (
+    TYPE datadog,
+    SECRET 'dd_prod',
+    INDEXES ['main'],
+    SERVICE_MAP_ENV 'prod',
+    SERVICE_MAP_START_TIME '-1h',
+    SERVICE_MAP_END_TIME 'now',
+    SERVICE_MAP_PRIMARY_TAG 'region:us-west-2'
+);
+
+SELECT source_service, target_service
+FROM dd.service_map.dependencies;
+```
+
+The table is lazy: `ATTACH` and schema inspection do not call the service-dependencies API. Relative
+windows are evaluated when each scan starts, so a long-lived attachment continues to represent the
+latest hour. Existing attachments that omit `SERVICE_MAP_ENV` still work for logs and alerts; the
+service-map table remains discoverable and gives a focused configuration error only if scanned.
+
+For an ad hoc environment or window, use the same scanner through the table function:
+
+```sql
+SELECT *
+FROM read_datadog_service_dependencies(
+    env => 'staging',
+    "from" => 'now-15m',
+    "to" => 'now',
+    primary_tag => 'region:us-east-1'
+);
+```
+
+`env` is required. `from` and `to` accept epoch seconds, `now`, or past relative values such as
+`-15m` and `now-1h` (units: `s`, `m`, `h`, `d`, or `w`). Optional `secret`, `retries`, and `timeout`
+parameters follow `read_datadog_logs`. The API response supplies topology but not per-edge types or
+statistics, so those canonical columns are `NULL` for Datadog.
+
+Both interfaces return the same schema, making provider maps easy to combine with
+`UNION ALL BY NAME`: `provider`, `source_service`, `target_service`, `source_type`, `target_type`, `edge_type`,
+`environment`, `window_start`, `window_end`, `request_count`, `error_count`, `fault_count`,
+`throttle_count`, `total_response_time_seconds`, `source_attributes`, `target_attributes`, and
+`edge_attributes`. The `window_*` columns are `TIMESTAMP_NS`; attributes are JSON strings when a
+provider supplies them. Datadog's service-dependencies endpoint is public beta and requires APM
+read access.
 
 For a bounded latest-logs relation suitable for an interactive browser query, configure the
 attachment explicitly:

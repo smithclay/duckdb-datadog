@@ -1,12 +1,16 @@
 #include "datadog_json.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 
 #include "yyjson.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
+#include <limits>
 #include <memory>
+#include <set>
 #include <unordered_set>
 
 using namespace duckdb_yyjson; // NOLINT
@@ -45,6 +49,185 @@ string BuildDatadogOpenAlertsPath(int64_t page, int64_t per_page) {
 	return "/api/v1/monitor/groups/search?query="
 	       "group_status%3A%28Alert%20OR%20Warn%20OR%20%22No%20Data%22%29&page=" +
 	       std::to_string(page) + "&per_page=" + std::to_string(per_page);
+}
+
+static string PercentEncodeQueryValue(const string &value) {
+	static constexpr char HEX[] = "0123456789ABCDEF";
+	string result;
+	result.reserve(value.size());
+	for (auto character : value) {
+		auto byte = static_cast<unsigned char>(character);
+		if ((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || (byte >= '0' && byte <= '9') ||
+		    byte == '-' || byte == '_' || byte == '.' || byte == '~') {
+			result.push_back(static_cast<char>(byte));
+		} else {
+			result.push_back('%');
+			result.push_back(HEX[byte >> 4]);
+			result.push_back(HEX[byte & 0x0F]);
+		}
+	}
+	return result;
+}
+
+string BuildDatadogServiceDependenciesPath(const string &environment, const string &primary_tag,
+                                           int64_t start_epoch_seconds, int64_t end_epoch_seconds) {
+	string result = "/api/v1/service_dependencies?env=" + PercentEncodeQueryValue(environment);
+	if (!primary_tag.empty()) {
+		result += "&primary_tag=" + PercentEncodeQueryValue(primary_tag);
+	}
+	result += "&start=" + std::to_string(start_epoch_seconds);
+	result += "&end=" + std::to_string(end_epoch_seconds);
+	return result;
+}
+
+vector<DatadogServiceDependency> ParseDatadogServiceDependencies(const string &response_json) {
+	YyjsonDocPtr doc(yyjson_read(response_json.c_str(), response_json.size(), 0));
+	if (!doc) {
+		throw IOException("Datadog service dependencies returned a response that is not valid JSON");
+	}
+	auto root = yyjson_doc_get_root(doc.get());
+	if (!root || !yyjson_is_obj(root)) {
+		throw IOException("Datadog service dependencies returned malformed data: expected a top-level object");
+	}
+
+	vector<DatadogServiceDependency> result;
+	std::set<std::pair<string, string>> seen_edges;
+	size_t service_index, service_max;
+	yyjson_val *service_key;
+	yyjson_val *service_value;
+	yyjson_obj_foreach(root, service_index, service_max, service_key, service_value) {
+		const char *source = yyjson_get_str(service_key);
+		if (!source || !service_value || !yyjson_is_obj(service_value)) {
+			throw IOException(
+			    "Datadog service dependencies returned malformed data: every service value must be an object");
+		}
+		auto calls = yyjson_obj_get(service_value, "calls");
+		if (!calls || !yyjson_is_arr(calls)) {
+			throw IOException(
+			    "Datadog service dependencies returned malformed data: service '%s'.calls must be an array", source);
+		}
+		size_t call_index, call_max;
+		yyjson_val *call;
+		yyjson_arr_foreach(calls, call_index, call_max, call) {
+			if (!yyjson_is_str(call)) {
+				throw IOException(
+				    "Datadog service dependencies returned malformed data: service '%s'.calls[%d] must be a string",
+				    source, call_index);
+			}
+			DatadogServiceDependency dependency {source, yyjson_get_str(call)};
+			if (seen_edges.emplace(dependency.source_service, dependency.target_service).second) {
+				result.push_back(std::move(dependency));
+			}
+		}
+	}
+	return result;
+}
+
+static int64_t ParseRelativeDurationSeconds(const string &value, const string &parameter_name) {
+	if (value.size() < 3 || value[0] != '-') {
+		throw InvalidInputException(
+		    "Datadog service map %s must be epoch seconds, 'now', or a past relative value such as '-1h' or 'now-1h'",
+		    parameter_name);
+	}
+	auto unit = value.back();
+	int64_t multiplier;
+	switch (unit) {
+	case 's':
+		multiplier = 1;
+		break;
+	case 'm':
+		multiplier = 60;
+		break;
+	case 'h':
+		multiplier = 60 * 60;
+		break;
+	case 'd':
+		multiplier = 24 * 60 * 60;
+		break;
+	case 'w':
+		multiplier = 7 * 24 * 60 * 60;
+		break;
+	default:
+		throw InvalidInputException("Datadog service map %s has an unsupported relative unit; use s, m, h, d, or w",
+		                            parameter_name);
+	}
+	int64_t magnitude = 0;
+	for (idx_t index = 1; index + 1 < value.size(); index++) {
+		auto character = value[index];
+		if (!std::isdigit(static_cast<unsigned char>(character))) {
+			throw InvalidInputException("Datadog service map %s has an invalid relative value '%s'", parameter_name,
+			                            value);
+		}
+		auto digit = static_cast<int64_t>(character - '0');
+		if (magnitude > (std::numeric_limits<int64_t>::max() - digit) / 10) {
+			throw InvalidInputException("Datadog service map %s relative value is too large", parameter_name);
+		}
+		magnitude = magnitude * 10 + digit;
+	}
+	if (magnitude == 0 || magnitude > std::numeric_limits<int64_t>::max() / multiplier) {
+		throw InvalidInputException("Datadog service map %s relative value must be positive and fit in seconds",
+		                            parameter_name);
+	}
+	return magnitude * multiplier;
+}
+
+static int64_t ResolveDatadogServiceMapEndpoint(const string &input, const string &parameter_name,
+                                                int64_t now_epoch_seconds) {
+	string normalized = input;
+	StringUtil::Trim(normalized);
+	normalized = StringUtil::Lower(normalized);
+	if (normalized == "now") {
+		return now_epoch_seconds;
+	}
+	string relative = normalized;
+	if (relative.rfind("now-", 0) == 0) {
+		relative = relative.substr(3);
+	}
+	if (!relative.empty() && relative[0] == '-') {
+		auto offset = ParseRelativeDurationSeconds(relative, parameter_name);
+		if (now_epoch_seconds < std::numeric_limits<int64_t>::min() + offset) {
+			throw InvalidInputException("Datadog service map %s relative value is out of range", parameter_name);
+		}
+		return now_epoch_seconds - offset;
+	}
+	if (normalized.empty()) {
+		throw InvalidInputException("Datadog service map %s must not be empty", parameter_name);
+	}
+	idx_t offset = normalized[0] == '-' ? 1 : 0;
+	if (offset == normalized.size()) {
+		throw InvalidInputException("Datadog service map %s has invalid epoch seconds '%s'", parameter_name,
+		                            normalized);
+	}
+	for (idx_t index = offset; index < normalized.size(); index++) {
+		if (!std::isdigit(static_cast<unsigned char>(normalized[index]))) {
+			throw InvalidInputException("Datadog service map %s must be epoch seconds, 'now', or a past relative value "
+			                            "such as '-1h' or 'now-1h'",
+			                            parameter_name);
+		}
+	}
+	try {
+		return std::stoll(normalized);
+	} catch (const std::exception &) {
+		throw InvalidInputException("Datadog service map %s epoch seconds are out of range", parameter_name);
+	}
+}
+
+DatadogServiceMapWindow ResolveDatadogServiceMapWindow(const string &from, const string &to,
+                                                       int64_t now_epoch_seconds) {
+	DatadogServiceMapWindow result;
+	result.start_epoch_seconds = ResolveDatadogServiceMapEndpoint(from, "from", now_epoch_seconds);
+	result.end_epoch_seconds = ResolveDatadogServiceMapEndpoint(to, "to", now_epoch_seconds);
+	if (result.start_epoch_seconds > result.end_epoch_seconds) {
+		throw InvalidInputException("Datadog service map from must not be later than to");
+	}
+	constexpr int64_t NANOS_PER_SECOND = 1000LL * 1000LL * 1000LL;
+	constexpr int64_t MIN_TIMESTAMP_SECONDS = std::numeric_limits<int64_t>::min() / NANOS_PER_SECOND;
+	constexpr int64_t MAX_TIMESTAMP_SECONDS = std::numeric_limits<int64_t>::max() / NANOS_PER_SECOND;
+	if (result.start_epoch_seconds < MIN_TIMESTAMP_SECONDS || result.start_epoch_seconds > MAX_TIMESTAMP_SECONDS ||
+	    result.end_epoch_seconds < MIN_TIMESTAMP_SECONDS || result.end_epoch_seconds > MAX_TIMESTAMP_SECONDS) {
+		throw InvalidInputException("Datadog service map window is outside the TIMESTAMP_NS range");
+	}
+	return result;
 }
 
 static bool ReadOptionalString(yyjson_val *object, const char *key, string &result, const string &location) {

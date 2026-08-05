@@ -47,6 +47,17 @@ struct DatadogOpenAlertsPage {
 	int64_t total_count = 0;
 };
 
+//! One directed caller -> callee edge returned by Datadog's APM service-dependencies endpoint.
+struct DatadogServiceDependency {
+	string source_service;
+	string target_service;
+};
+
+struct DatadogServiceMapWindow {
+	int64_t start_epoch_seconds = 0;
+	int64_t end_epoch_seconds = 0;
+};
+
 //! Parse GET /api/v1/logs/config/indexes, validating every returned index name and
 //! deduplicating exact names while preserving response order.
 vector<string> ParseDatadogLogIndexes(const string &response_json);
@@ -57,6 +68,20 @@ string BuildDatadogOpenAlertsPath(int64_t page, int64_t per_page);
 
 //! Parse one response from /api/v1/monitor/groups/search.
 DatadogOpenAlertsPage ParseDatadogOpenAlertsPage(const string &response_json);
+
+//! Build the percent-encoded GET target for /api/v1/service_dependencies. Start and end are
+//! always explicit so the rows' window columns exactly describe the requested graph.
+string BuildDatadogServiceDependenciesPath(const string &environment, const string &primary_tag,
+                                           int64_t start_epoch_seconds, int64_t end_epoch_seconds);
+
+//! Parse the public-beta service-dependencies object into directed caller -> callee edges.
+//! Unknown fields inside a service object are ignored for forward compatibility.
+vector<DatadogServiceDependency> ParseDatadogServiceDependencies(const string &response_json);
+
+//! Resolve epoch-second or relative (`now`, `-15m`, `now-1h`) endpoints against the supplied
+//! current epoch second. Supplying `now` makes this deterministic and independently testable;
+//! scans call it only when execution starts, never when a catalog is attached.
+DatadogServiceMapWindow ResolveDatadogServiceMapWindow(const string &from, const string &to, int64_t now_epoch_seconds);
 
 //! Combine the user's query with conservative query terms translated from SQL.
 //! The original query is unchanged when there are no pushed terms.

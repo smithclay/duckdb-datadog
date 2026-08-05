@@ -15,8 +15,8 @@ class Client;
 namespace duckdb {
 class ClientContext;
 
-//! Minimal client for the Datadog APIs used by this extension: log search/index discovery and
-//! triggered monitor-group search. It owns shared
+//! Minimal client for the Datadog APIs used by this extension: log search/index discovery,
+//! triggered monitor-group search, and APM service dependencies. It owns shared
 //! authentication, transport, timeout, retry, and cancellation behavior; pagination and JSON
 //! mapping live outside the client. A single keep-alive connection is reused across calls.
 struct DatadogClient {
@@ -59,6 +59,11 @@ struct DatadogClient {
 	//! GET one page of currently triggered monitor groups (Alert, Warn, or No Data) from
 	//! /api/v1/monitor/groups/search. The returned JSON is parsed by the catalog table scan.
 	string SearchOpenAlerts(ClientContext &context, int64_t page, int64_t per_page) const;
+
+	//! GET the APM service-dependency graph for one environment, optional primary tag, and
+	//! epoch-second window from /api/v1/service_dependencies.
+	string GetServiceDependencies(ClientContext &context, const string &environment, const string &primary_tag,
+	                              int64_t start_epoch_seconds, int64_t end_epoch_seconds) const;
 
 	//! GET /api/v1/logs/config/indexes and return the raw response body. Authentication,
 	//! connection pooling, timeouts, retries, cancellation, and TLS behavior are shared with

@@ -62,6 +62,58 @@ int main() {
 		}
 		Require(malformed_rejected, "malformed open-alert group tags should be rejected");
 
+		Require(BuildDatadogServiceDependenciesPath("prod/us east", "region:us-west-2", 1700000000, 1700003600) ==
+		            "/api/v1/service_dependencies?env=prod%2Fus%20east&primary_tag=region%3Aus-west-2&"
+		            "start=1700000000&end=1700003600",
+		        "service-dependency query values should be RFC 3986 percent-encoded");
+		Require(BuildDatadogServiceDependenciesPath("prod", "", 1, 2) ==
+		            "/api/v1/service_dependencies?env=prod&start=1&end=2",
+		        "an absent primary tag should be omitted from the service-dependency request");
+
+		auto dependencies = ParseDatadogServiceDependencies(R"({
+			"web":{"calls":["checkout","checkout","database"],"public_beta_future_field":true},
+			"checkout":{"calls":["database"]},
+			"database":{"calls":[]}
+		})");
+		Require(dependencies.size() == 3, "duplicate source-target dependency edges should be removed");
+		Require(dependencies[0].source_service == "web" && dependencies[0].target_service == "checkout",
+		        "dependency parsing should preserve source and target names");
+		Require(dependencies[1].source_service == "web" && dependencies[1].target_service == "database" &&
+		            dependencies[2].source_service == "checkout" && dependencies[2].target_service == "database",
+		        "dependency parsing should preserve first-seen edge order");
+
+		malformed_rejected = false;
+		try {
+			ParseDatadogServiceDependencies(R"({"web":{"calls":[null]}})");
+		} catch (const IOException &) {
+			malformed_rejected = true;
+		}
+		Require(malformed_rejected, "malformed service-dependency calls should be rejected");
+
+		auto service_window = ResolveDatadogServiceMapWindow("-1h", "now", 1700003600);
+		Require(service_window.start_epoch_seconds == 1700000000 && service_window.end_epoch_seconds == 1700003600,
+		        "relative service-map windows should resolve against the supplied scan clock");
+		service_window = ResolveDatadogServiceMapWindow(" NOW-15M ", " NOW ", 1700003600);
+		Require(service_window.start_epoch_seconds == 1700002700 && service_window.end_epoch_seconds == 1700003600,
+		        "relative service-map windows should tolerate whitespace and case");
+		service_window = ResolveDatadogServiceMapWindow("1700000000", "1700003600", 123);
+		Require(service_window.start_epoch_seconds == 1700000000 && service_window.end_epoch_seconds == 1700003600,
+		        "absolute service-map epoch seconds should not depend on the scan clock");
+		malformed_rejected = false;
+		try {
+			ResolveDatadogServiceMapWindow("now", "-1h", 1700003600);
+		} catch (const InvalidInputException &) {
+			malformed_rejected = true;
+		}
+		Require(malformed_rejected, "a reversed service-map window should be rejected");
+		malformed_rejected = false;
+		try {
+			ResolveDatadogServiceMapWindow("0", "9223372037", 1700003600);
+		} catch (const InvalidInputException &) {
+			malformed_rejected = true;
+		}
+		Require(malformed_rejected, "service-map windows outside TIMESTAMP_NS range should be rejected");
+
 		auto bound = BuildDatadogLogsSearchBody("*", "now-15m", "now", "timestamp", 1000, "", {"main"});
 		Require(bound.find("\"indexes\":[\"main\"]") != string::npos,
 		        "catalog search body should contain exactly its bound index");

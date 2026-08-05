@@ -5,6 +5,7 @@
 #include "datadog_json.hpp"
 #include "datadog_secret.hpp"
 #include "logs_table.hpp"
+#include "service_dependencies_table.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -299,12 +300,135 @@ private:
 	unique_ptr<DatadogOpenAlertsTableEntry> open_table;
 };
 
+class DatadogServiceDependenciesTableEntry : public TableCatalogEntry {
+public:
+	DatadogServiceDependenciesTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, const string &secret_name,
+	                                     const DatadogServiceMapSettings &settings)
+	    : DatadogServiceDependenciesTableEntry(catalog, schema, secret_name, settings, CreateInfo(schema)) {
+	}
+
+	unique_ptr<BaseStatistics> GetStatistics(ClientContext &, column_t) override {
+		return nullptr;
+	}
+
+	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override {
+		return GetDatadogServiceDependenciesTableScan(context, *this, secret_name, settings, bind_data);
+	}
+
+	TableStorageInfo GetStorageInfo(ClientContext &) override {
+		return TableStorageInfo();
+	}
+
+private:
+	DatadogServiceDependenciesTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, const string &secret_name,
+	                                     const DatadogServiceMapSettings &settings, CreateTableInfo info)
+	    : TableCatalogEntry(catalog, schema, info), secret_name(secret_name), settings(settings) {
+	}
+
+	static CreateTableInfo CreateInfo(SchemaCatalogEntry &schema) {
+		CreateTableInfo info(schema, "dependencies");
+		vector<LogicalType> types;
+		vector<string> names;
+		GetDatadogServiceDependenciesSchema(types, names);
+		for (idx_t index = 0; index < names.size(); index++) {
+			info.columns.AddColumn(ColumnDefinition(names[index], types[index]));
+		}
+		return info;
+	}
+
+	string secret_name;
+	DatadogServiceMapSettings settings;
+};
+
+class DatadogServiceMapSchemaEntry : public SchemaCatalogEntry {
+public:
+	DatadogServiceMapSchemaEntry(Catalog &catalog, const string &secret_name, const DatadogServiceMapSettings &settings)
+	    : DatadogServiceMapSchemaEntry(catalog, secret_name, settings, CreateInfo()) {
+	}
+
+private:
+	DatadogServiceMapSchemaEntry(Catalog &catalog, const string &secret_name, const DatadogServiceMapSettings &settings,
+	                             CreateSchemaInfo info)
+	    : SchemaCatalogEntry(catalog, info),
+	      dependencies_table(make_uniq<DatadogServiceDependenciesTableEntry>(catalog, *this, secret_name, settings)) {
+	}
+
+public:
+	void Scan(ClientContext &, CatalogType type, const std::function<void(CatalogEntry &)> &callback) override {
+		Scan(type, callback);
+	}
+
+	void Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) override {
+		if (type == CatalogType::TABLE_ENTRY) {
+			callback(*dependencies_table);
+		}
+	}
+
+	optional_ptr<CatalogEntry> LookupEntry(CatalogTransaction, const EntryLookupInfo &lookup_info) override {
+		if (lookup_info.GetCatalogType() == CatalogType::TABLE_ENTRY &&
+		    StringUtil::CIEquals(lookup_info.GetEntryName(), "dependencies")) {
+			return dependencies_table.get();
+		}
+		return nullptr;
+	}
+
+	optional_ptr<CatalogEntry> CreateIndex(CatalogTransaction, CreateIndexInfo &, TableCatalogEntry &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateFunction(CatalogTransaction, CreateFunctionInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateTable(CatalogTransaction, BoundCreateTableInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateView(CatalogTransaction, CreateViewInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateSequence(CatalogTransaction, CreateSequenceInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateTableFunction(CatalogTransaction, CreateTableFunctionInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateCopyFunction(CatalogTransaction, CreateCopyFunctionInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreatePragmaFunction(CatalogTransaction, CreatePragmaFunctionInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateCollation(CatalogTransaction, CreateCollationInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateCoordinateSystem(CatalogTransaction, CreateCoordinateSystemInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateType(CatalogTransaction, CreateTypeInfo &) override {
+		ThrowReadOnly();
+	}
+	void DropEntry(ClientContext &, DropInfo &) override {
+		ThrowReadOnly();
+	}
+	void Alter(CatalogTransaction, AlterInfo &) override {
+		ThrowReadOnly();
+	}
+
+private:
+	static CreateSchemaInfo CreateInfo() {
+		CreateSchemaInfo info;
+		info.schema = "service_map";
+		return info;
+	}
+
+	unique_ptr<DatadogServiceDependenciesTableEntry> dependencies_table;
+};
+
 class DatadogCatalog : public Catalog {
 public:
 	DatadogCatalog(AttachedDatabase &db, vector<string> indexes, string secret_name,
-	               const DatadogLogsSettings &settings)
+	               const DatadogLogsSettings &settings, const DatadogServiceMapSettings &service_map_settings)
 	    : Catalog(db), logs_schema(make_uniq<DatadogSchemaEntry>(*this, indexes, secret_name, settings)),
-	      alerts_schema(make_uniq<DatadogAlertsSchemaEntry>(*this, secret_name, settings)) {
+	      alerts_schema(make_uniq<DatadogAlertsSchemaEntry>(*this, secret_name, settings)),
+	      service_map_schema(make_uniq<DatadogServiceMapSchemaEntry>(*this, secret_name, service_map_settings)) {
 	}
 
 	void Initialize(bool) override {
@@ -321,6 +445,7 @@ public:
 	void ScanSchemas(ClientContext &, std::function<void(SchemaCatalogEntry &)> callback) override {
 		callback(*logs_schema);
 		callback(*alerts_schema);
+		callback(*service_map_schema);
 	}
 
 	optional_ptr<SchemaCatalogEntry> LookupSchema(CatalogTransaction, const EntryLookupInfo &schema_lookup,
@@ -330,6 +455,9 @@ public:
 		}
 		if (StringUtil::CIEquals(schema_lookup.GetEntryName(), "alerts")) {
 			return alerts_schema.get();
+		}
+		if (StringUtil::CIEquals(schema_lookup.GetEntryName(), "service_map")) {
+			return service_map_schema.get();
 		}
 		if (if_not_found == OnEntryNotFound::THROW_EXCEPTION) {
 			throw CatalogException(schema_lookup.GetErrorContext(), "Schema with name %s does not exist!",
@@ -372,6 +500,7 @@ private:
 
 	unique_ptr<DatadogSchemaEntry> logs_schema;
 	unique_ptr<DatadogAlertsSchemaEntry> alerts_schema;
+	unique_ptr<DatadogServiceMapSchemaEntry> service_map_schema;
 };
 
 class DatadogTransaction : public Transaction {
@@ -459,6 +588,7 @@ static unique_ptr<Catalog> AttachDatadog(optional_ptr<StorageExtensionInfo>, Cli
 	string secret_name;
 	vector<string> indexes;
 	DatadogLogsSettings settings;
+	DatadogServiceMapSettings service_map_settings;
 	bool indexes_supplied = false;
 	for (const auto &option : options.options) {
 		auto key = StringUtil::Lower(option.first);
@@ -486,14 +616,44 @@ static unique_ptr<Catalog> AttachDatadog(optional_ptr<StorageExtensionInfo>, Cli
 			settings.retries = ParseAttachInteger("RETRIES", option.second);
 		} else if (key == "timeout") {
 			settings.timeout_seconds = ParseAttachInteger("TIMEOUT", option.second);
+		} else if (key == "service_map_env") {
+			if (option.second.IsNull() || option.second.type().id() != LogicalTypeId::VARCHAR) {
+				throw InvalidInputException("Datadog ATTACH option SERVICE_MAP_ENV must be a non-null VARCHAR");
+			}
+			service_map_settings.environment = option.second.GetValue<string>();
+			if (service_map_settings.environment.empty()) {
+				throw InvalidInputException("Datadog ATTACH option SERVICE_MAP_ENV must not be empty");
+			}
+		} else if (key == "service_map_start_time") {
+			if (option.second.IsNull() || option.second.type().id() != LogicalTypeId::VARCHAR) {
+				throw InvalidInputException("Datadog ATTACH option SERVICE_MAP_START_TIME must be a non-null VARCHAR");
+			}
+			service_map_settings.from = option.second.GetValue<string>();
+		} else if (key == "service_map_end_time") {
+			if (option.second.IsNull() || option.second.type().id() != LogicalTypeId::VARCHAR) {
+				throw InvalidInputException("Datadog ATTACH option SERVICE_MAP_END_TIME must be a non-null VARCHAR");
+			}
+			service_map_settings.to = option.second.GetValue<string>();
+		} else if (key == "service_map_primary_tag") {
+			if (option.second.IsNull() || option.second.type().id() != LogicalTypeId::VARCHAR) {
+				throw InvalidInputException("Datadog ATTACH option SERVICE_MAP_PRIMARY_TAG must be a non-null VARCHAR");
+			}
+			service_map_settings.primary_tag = option.second.GetValue<string>();
+			if (service_map_settings.primary_tag.empty()) {
+				throw InvalidInputException("Datadog ATTACH option SERVICE_MAP_PRIMARY_TAG must not be empty");
+			}
 		} else {
 			throw InvalidInputException(
 			    "Unsupported Datadog ATTACH option '%s'; supported options are SECRET, INDEXES, "
-			    "SORT, PAGE_SIZE, MAX_ROWS, RETRIES, and TIMEOUT",
+			    "SORT, PAGE_SIZE, MAX_ROWS, RETRIES, TIMEOUT, SERVICE_MAP_ENV, "
+			    "SERVICE_MAP_START_TIME, SERVICE_MAP_END_TIME, and SERVICE_MAP_PRIMARY_TAG",
 			    option.first);
 		}
 	}
 	ValidateDatadogLogsSettings(settings, "Datadog ATTACH");
+	service_map_settings.retries = settings.retries;
+	service_map_settings.timeout_seconds = settings.timeout_seconds;
+	ValidateDatadogServiceMapSettings(service_map_settings, "Datadog ATTACH service map", false);
 
 	// Always validate/select the secret at attach time, but retain only its name. Explicit
 	// INDEXES never performs a network request.
@@ -514,7 +674,7 @@ static unique_ptr<Catalog> AttachDatadog(optional_ptr<StorageExtensionInfo>, Cli
 	}
 
 	db.SetReadOnlyDatabase();
-	return make_uniq<DatadogCatalog>(db, std::move(indexes), std::move(secret_name), settings);
+	return make_uniq<DatadogCatalog>(db, std::move(indexes), std::move(secret_name), settings, service_map_settings);
 }
 
 static unique_ptr<TransactionManager> CreateDatadogTransactionManager(optional_ptr<StorageExtensionInfo>,

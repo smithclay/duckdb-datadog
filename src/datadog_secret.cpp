@@ -15,8 +15,8 @@ static unique_ptr<BaseSecret> CreateDatadogSecretFromConfig(ClientContext &conte
 	// Only copy the keys we understand; ignore anything else.
 	for (const auto &option : input.options) {
 		auto lower_name = StringUtil::Lower(option.first);
-		if (lower_name == "api_key" || lower_name == "app_key" || lower_name == "site" ||
-		    lower_name == "intake_url") {
+		if (lower_name == "api_key" || lower_name == "app_key" || lower_name == "site" || lower_name == "intake_url" ||
+		    lower_name == "trace_agent_url") {
 			secret->secret_map[lower_name] = option.second;
 		}
 	}
@@ -40,10 +40,13 @@ void RegisterDatadogSecretType(ExtensionLoader &loader) {
 	// Intake base URL override for send_datadog_logs: a local datadog_serve listener or an
 	// intake proxy. Not a credential, so it is not redacted.
 	datadog_secret_function.named_parameters["intake_url"] = LogicalType::VARCHAR;
+	// Trace agent base URL override for write_datadog_traces (default: http://localhost:8126).
+	// Also configuration rather than a credential.
+	datadog_secret_function.named_parameters["trace_agent_url"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(datadog_secret_function);
 }
 
-DatadogCredentials GetDatadogCredentials(ClientContext &context, const string &secret_name) {
+bool TryGetDatadogCredentials(ClientContext &context, const string &secret_name, DatadogCredentials &credentials) {
 	auto &secret_manager = SecretManager::Get(context);
 	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
 
@@ -62,9 +65,7 @@ DatadogCredentials GetDatadogCredentials(ClientContext &context, const string &s
 			}
 		}
 		if (!entry) {
-			throw InvalidInputException("No 'datadog' secret found. Create one first, e.g.:\n"
-			                            "  CREATE SECRET (TYPE datadog, API_KEY '<dd-api-key>', APP_KEY "
-			                            "'<dd-app-key>', SITE 'datadoghq.com');");
+			return false;
 		}
 	}
 
@@ -93,7 +94,20 @@ DatadogCredentials GetDatadogCredentials(ClientContext &context, const string &s
 	if (kv_secret->TryGetValue("intake_url", value) && !value.IsNull()) {
 		creds.intake_url = value.ToString();
 	}
+	if (kv_secret->TryGetValue("trace_agent_url", value) && !value.IsNull()) {
+		creds.trace_agent_url = value.ToString();
+	}
+	credentials = std::move(creds);
+	return true;
+}
 
+DatadogCredentials GetDatadogCredentials(ClientContext &context, const string &secret_name) {
+	DatadogCredentials creds;
+	if (!TryGetDatadogCredentials(context, secret_name, creds)) {
+		throw InvalidInputException("No 'datadog' secret found. Create one first, e.g.:\n"
+		                            "  CREATE SECRET (TYPE datadog, API_KEY '<dd-api-key>', APP_KEY "
+		                            "'<dd-app-key>', SITE 'datadoghq.com');");
+	}
 	if (creds.api_key.empty()) {
 		throw InvalidInputException("datadog secret is missing required field API_KEY");
 	}

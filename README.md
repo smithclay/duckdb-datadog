@@ -7,11 +7,11 @@ Log rows conform to the [duckdb-otlp](https://github.com/smithclay/otlp2records)
 `read_otlp_logs` schema, so Datadog logs drop straight into an OTLP-shaped lakehouse alongside
 data from other sources.
 
-Reading, receiving, and sending logs, reading open monitor alerts, and querying service maps are
-supported today;
-traces/spans and metrics are planned.
-See [Receiving logs](#receiving-logs) for the native `datadog_serve` intake server and
-[Sending logs](#sending-logs) for the `send_datadog_logs` scalar function.
+Reading, receiving, and sending logs, reading and writing traces/spans, reading open monitor
+alerts, and querying service maps are supported today.
+See [Receiving logs](#receiving-logs) for the native `datadog_serve` intake server,
+[Sending logs](#sending-logs) for the `send_datadog_logs` scalar function, and
+[Traces](#traces) for `read_datadog_traces` / `write_datadog_traces`.
 
 ## Quick start
 
@@ -475,6 +475,82 @@ SELECT count(*) FROM received;  -- the logs, round-tripped without leaving the p
 
 This makes the whole send path testable offline; `test/sql/datadog_send_local.test` is exactly
 this loop. Reads (`read_datadog_logs` and friends) are unaffected by `INTAKE_URL`.
+
+## Traces
+
+### Reading spans
+
+`read_datadog_traces` reads indexed spans through the
+[Spans API](https://docs.datadoghq.com/api/latest/spans/#search-spans) into the
+[duckdb-otlp `read_otlp_traces`](https://smithclay.github.io/duckdb-otlp/reference/schemas/#traces-read_otlp_traces)
+24-column schema, so Datadog spans line up with trace data from any other OTLP source:
+
+```sql
+-- Slow checkout spans in the last hour.
+SELECT trace_id, name, service_name, duration_time_unix_nano / 1e6 AS ms
+FROM read_datadog_traces(
+    query  => 'service:checkout @duration:>1s',
+    "from" => 'now-1h',
+    "to"   => 'now'
+)
+ORDER BY duration_time_unix_nano DESC;
+```
+
+Parameters (`query`, `from`, `to`, `sort`, `page_size`, `max_rows`, `retries`, `timeout`,
+`secret`) behave exactly like `read_datadog_logs`, including cursor pagination, retry/rate-limit
+handling, and projection pushdown. `query` takes Datadog's span search syntax. Requires
+`APP_KEY` with the `apm_read` permission.
+
+Column notes for the Datadog mapping:
+- `start_time_unix_nano` / `duration_time_unix_nano` come from the span's start/end timestamps
+  (falling back to the custom `duration` measure, which Datadog records in nanoseconds).
+- `trace_id`, `span_id`, `parent_span_id` are passed through as the API's string form.
+- `name` is the Datadog operation name when present, else `resource_name`.
+- `kind` and error status (`status_code` = 2, `status_status_message`) are derived from the
+  `span.kind` and `error.*` tags when the span carries them.
+- `span_attributes` is the span's custom attributes plus Datadog's reserved per-span fields
+  (`resource_name`, `type`, `single_span`, `ingestion_reason`, `retained_by`);
+  `resource_attributes` carries `host`, `env`, and `ddtags`. Columns Datadog has no equivalent
+  for (`trace_state`, `scope_*`, `events_json`, `links_json`, `dropped_*`, `flags`) are `NULL`.
+
+### Writing spans
+
+`write_datadog_traces` sends OTLP-shaped span rows to a **Datadog Agent** — Datadog's backend has
+no public JSON trace intake, so traces go through the Agent's
+[local trace API](https://docs.datadoghq.com/api/latest/tracing/) (`http://localhost:8126` by
+default). Like `send_datadog_logs` it takes a `STRUCT` per row and returns `'ok'` per sent span:
+
+```sql
+-- No secret needed for a local Agent:
+SELECT write_datadog_traces(t) FROM my_spans t;
+
+-- Round-trip spans from one account/window into another Agent:
+SELECT write_datadog_traces(t)
+FROM read_datadog_traces(query => 'service:checkout', "from" => 'now-15m') t;
+```
+
+Recognized columns (first match wins): `trace_id` and `span_id` (required; OTLP hex strings or
+unsigned integers), `parent_span_id`/`parent_id`, `name`/`operation_name`,
+`resource`/`resource_name` (defaults to the name), `service_name`/`service`,
+`start_time_unix_nano` (TIMESTAMP or integer epoch nanoseconds; required),
+`duration_time_unix_nano`/`duration_ns`/`duration`, `kind` (OTLP integer → `span.kind` tag;
+servers default to type `web`), `type`/`span_type`, `status_code` (2 → `error: 1`),
+`status_status_message`/`status_message` (→ `error.message`), `trace_state`, `events_json`,
+`links_json`, and JSON `span_attributes`/`resource_attributes` (strings → `meta`, numbers →
+`metrics`).
+
+Notes:
+- A 128-bit hex `trace_id` is split Datadog-style: lower 64 bits become the wire trace id and the
+  upper 64 bits ride in the `_dd.p.tid` tag, so 128-bit OTLP traces keep their identity.
+- Rows that cannot form a valid span (missing/invalid `trace_id`, `span_id`, or start time)
+  return `'skipped: <reason>'` instead of failing the whole send; a `NULL` struct returns `NULL`.
+- Spans are grouped into traces per chunk and sent as one JSON `PUT /v0.3/traces` request, with
+  the same conservative non-idempotent retry rules as `send_datadog_logs`.
+- The optional `TRACE_AGENT_URL` secret field points the writer at a remote Agent or a mock in
+  CI (a trailing `/v0.3/traces` is stripped). `DD-API-KEY` is attached only when the secret has
+  an `API_KEY`, so a plain local Agent needs no secret at all.
+- The Agent applies its own normalization and sampling; spans older than the Agent's acceptance
+  window may be dropped.
 
 ## Building
 

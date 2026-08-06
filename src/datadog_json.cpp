@@ -459,8 +459,8 @@ string BuildDatadogLogsSearchBody(const string &query, const string &from, const
 }
 
 string BuildDatadogLogsAggregateBody(const string &query, const string &from, const string &to,
-                                     const string &aggregation, const string &metric,
-                                     const vector<string> &group_by, int64_t group_limit) {
+                                     const string &aggregation, const string &metric, const vector<string> &group_by,
+                                     int64_t group_limit) {
 	YyjsonMutDocPtr doc(yyjson_mut_doc_new(nullptr));
 	auto root = yyjson_mut_obj(doc.get());
 	yyjson_mut_doc_set_root(doc.get(), root);
@@ -540,6 +540,204 @@ vector<DatadogLogStatsBucket> ParseDatadogLogsAggregateResponse(const string &re
 		result.push_back(std::move(row));
 	}
 	return result;
+}
+
+string BuildDatadogSpansSearchBody(const string &query, const string &from, const string &to, const string &sort,
+                                   int64_t limit, const string &cursor) {
+	YyjsonMutDocPtr doc(yyjson_mut_doc_new(nullptr));
+	auto root = yyjson_mut_obj(doc.get());
+	yyjson_mut_doc_set_root(doc.get(), root);
+
+	auto data = yyjson_mut_obj(doc.get());
+	yyjson_mut_obj_add_str(doc.get(), data, "type", "search_request");
+
+	auto attributes = yyjson_mut_obj(doc.get());
+	auto filter = yyjson_mut_obj(doc.get());
+	yyjson_mut_obj_add_strcpy(doc.get(), filter, "query", query.c_str());
+	yyjson_mut_obj_add_strcpy(doc.get(), filter, "from", from.c_str());
+	yyjson_mut_obj_add_strcpy(doc.get(), filter, "to", to.c_str());
+	yyjson_mut_obj_add_val(doc.get(), attributes, "filter", filter);
+
+	yyjson_mut_obj_add_strcpy(doc.get(), attributes, "sort", sort.c_str());
+
+	auto page = yyjson_mut_obj(doc.get());
+	yyjson_mut_obj_add_int(doc.get(), page, "limit", limit);
+	if (!cursor.empty()) {
+		yyjson_mut_obj_add_strcpy(doc.get(), page, "cursor", cursor.c_str());
+	}
+	yyjson_mut_obj_add_val(doc.get(), attributes, "page", page);
+
+	yyjson_mut_obj_add_val(doc.get(), data, "attributes", attributes);
+	yyjson_mut_obj_add_val(doc.get(), root, "data", data);
+
+	YyjsonStrPtr json(yyjson_mut_write(doc.get(), 0, nullptr));
+	return json ? string(json.get()) : string();
+}
+
+bool ParseDatadogHexId(const string &text, uint64_t &low, string &high_hex) {
+	string trimmed = text;
+	StringUtil::Trim(trimmed);
+	if (trimmed.size() >= 2 && trimmed[0] == '0' && (trimmed[1] == 'x' || trimmed[1] == 'X')) {
+		trimmed = trimmed.substr(2);
+	}
+	if (trimmed.empty() || trimmed.size() > 32) {
+		return false;
+	}
+	uint64_t parsed_low = 0;
+	uint64_t parsed_high = 0;
+	for (auto character : trimmed) {
+		uint64_t digit;
+		if (character >= '0' && character <= '9') {
+			digit = static_cast<uint64_t>(character - '0');
+		} else if (character >= 'a' && character <= 'f') {
+			digit = static_cast<uint64_t>(character - 'a') + 10;
+		} else if (character >= 'A' && character <= 'F') {
+			digit = static_cast<uint64_t>(character - 'A') + 10;
+		} else {
+			return false;
+		}
+		parsed_high = (parsed_high << 4) | (parsed_low >> 60);
+		parsed_low = (parsed_low << 4) | digit;
+	}
+	low = parsed_low;
+	high_hex = string();
+	if (parsed_high != 0) {
+		static constexpr char HEX_DIGITS[] = "0123456789abcdef";
+		bool started = false;
+		for (int shift = 60; shift >= 0; shift -= 4) {
+			auto nibble = (parsed_high >> shift) & 0xF;
+			if (!started && nibble == 0) {
+				continue;
+			}
+			started = true;
+			high_hex.push_back(HEX_DIGITS[nibble]);
+		}
+	}
+	return true;
+}
+
+//! Distribute one attribute JSON object across a span's meta (strings) and metrics (numbers)
+//! objects. Booleans become "true"/"false" meta strings; objects and arrays are serialized to
+//! compact JSON meta strings; nulls are dropped. Keys already present in either object are never
+//! overwritten, and malformed input is silently ignored so a bad attribute column cannot fail the
+//! whole send.
+static void MergeAttributesIntoAgentSpan(yyjson_mut_doc *doc, yyjson_mut_val *meta, yyjson_mut_val *metrics,
+                                         const string &attributes_json) {
+	if (attributes_json.empty()) {
+		return;
+	}
+	YyjsonDocPtr parsed(yyjson_read(attributes_json.c_str(), attributes_json.size(), 0));
+	if (!parsed) {
+		return;
+	}
+	yyjson_val *root = yyjson_doc_get_root(parsed.get());
+	if (!root || !yyjson_is_obj(root)) {
+		return;
+	}
+	yyjson_obj_iter iter;
+	yyjson_obj_iter_init(root, &iter);
+	yyjson_val *key;
+	while ((key = yyjson_obj_iter_next(&iter))) {
+		const char *key_str = yyjson_get_str(key);
+		if (!key_str || yyjson_mut_obj_get(meta, key_str) || yyjson_mut_obj_get(metrics, key_str)) {
+			continue;
+		}
+		yyjson_val *val = yyjson_obj_iter_get_val(key);
+		// The key must be copied into the mutable doc: the *_add_strcpy helpers copy only the
+		// value, and `key_str` dies with the parsed source doc before the body is serialized.
+		yyjson_mut_val *mut_key = yyjson_mut_strcpy(doc, key_str);
+		if (!mut_key) {
+			continue;
+		}
+		if (yyjson_is_str(val)) {
+			yyjson_mut_obj_add(meta, mut_key, yyjson_mut_strcpy(doc, yyjson_get_str(val)));
+		} else if (yyjson_is_num(val)) {
+			yyjson_mut_obj_add(metrics, mut_key, yyjson_mut_real(doc, yyjson_get_num(val)));
+		} else if (yyjson_is_bool(val)) {
+			yyjson_mut_obj_add(meta, mut_key, yyjson_mut_str(doc, yyjson_get_bool(val) ? "true" : "false"));
+		} else if (yyjson_is_obj(val) || yyjson_is_arr(val)) {
+			size_t length = 0;
+			YyjsonStrPtr serialized(yyjson_val_write(val, 0, &length));
+			if (serialized) {
+				yyjson_mut_obj_add(meta, mut_key, yyjson_mut_strncpy(doc, serialized.get(), length));
+			}
+		}
+		// null values are dropped: the agent's meta/metrics carry only strings and numbers.
+	}
+}
+
+string BuildDatadogAgentTracesBody(const DatadogAgentSpan *spans, idx_t count, idx_t &trace_count) {
+	YyjsonMutDocPtr doc(yyjson_mut_doc_new(nullptr));
+	auto traces = yyjson_mut_arr(doc.get());
+	yyjson_mut_doc_set_root(doc.get(), traces);
+
+	// Group spans into one array per trace, preserving first-seen trace order. The key includes the
+	// upper 64 bits so two 128-bit traces sharing lower bits can never be merged.
+	std::unordered_map<string, yyjson_mut_val *> trace_arrays;
+	trace_count = 0;
+	for (idx_t i = 0; i < count; i++) {
+		const auto &span = spans[i];
+		auto trace_key = span.trace_id_high_hex + ":" + std::to_string(span.trace_id);
+		auto entry = trace_arrays.find(trace_key);
+		yyjson_mut_val *trace;
+		if (entry == trace_arrays.end()) {
+			trace = yyjson_mut_arr(doc.get());
+			yyjson_mut_arr_append(traces, trace);
+			trace_arrays.emplace(std::move(trace_key), trace);
+			trace_count++;
+		} else {
+			trace = entry->second;
+		}
+
+		auto obj = yyjson_mut_obj(doc.get());
+		yyjson_mut_obj_add_uint(doc.get(), obj, "trace_id", span.trace_id);
+		yyjson_mut_obj_add_uint(doc.get(), obj, "span_id", span.span_id);
+		if (span.has_parent_id) {
+			yyjson_mut_obj_add_uint(doc.get(), obj, "parent_id", span.parent_id);
+		}
+		if (!span.service.empty()) {
+			yyjson_mut_obj_add_strcpy(doc.get(), obj, "service", span.service.c_str());
+		}
+		if (!span.name.empty()) {
+			yyjson_mut_obj_add_strcpy(doc.get(), obj, "name", span.name.c_str());
+		}
+		if (!span.resource.empty()) {
+			yyjson_mut_obj_add_strcpy(doc.get(), obj, "resource", span.resource.c_str());
+		}
+		if (!span.type.empty()) {
+			yyjson_mut_obj_add_strcpy(doc.get(), obj, "type", span.type.c_str());
+		}
+		yyjson_mut_obj_add_int(doc.get(), obj, "start", span.start_ns);
+		yyjson_mut_obj_add_int(doc.get(), obj, "duration", span.duration_ns);
+		if (span.error) {
+			yyjson_mut_obj_add_int(doc.get(), obj, "error", 1);
+		}
+
+		auto meta = yyjson_mut_obj(doc.get());
+		auto metrics = yyjson_mut_obj(doc.get());
+		// Reserved entries first so attribute JSON can never clobber them.
+		if (!span.trace_id_high_hex.empty()) {
+			yyjson_mut_obj_add_strcpy(doc.get(), meta, "_dd.p.tid", span.trace_id_high_hex.c_str());
+		}
+		for (const auto &pair : span.meta) {
+			if (!pair.second.empty() && !yyjson_mut_obj_get(meta, pair.first.c_str())) {
+				yyjson_mut_obj_add_strcpy(doc.get(), meta, pair.first.c_str(), pair.second.c_str());
+			}
+		}
+		MergeAttributesIntoAgentSpan(doc.get(), meta, metrics, span.span_attributes_json);
+		MergeAttributesIntoAgentSpan(doc.get(), meta, metrics, span.resource_attributes_json);
+		if (yyjson_mut_obj_size(meta) > 0) {
+			yyjson_mut_obj_add_val(doc.get(), obj, "meta", meta);
+		}
+		if (yyjson_mut_obj_size(metrics) > 0) {
+			yyjson_mut_obj_add_val(doc.get(), obj, "metrics", metrics);
+		}
+
+		yyjson_mut_arr_append(trace, obj);
+	}
+
+	YyjsonStrPtr json(yyjson_mut_write(doc.get(), 0, nullptr));
+	return json ? string(json.get()) : string("[]");
 }
 
 //! Merge every key of the JSON object `source_json` into `dest` as a top-level custom attribute,

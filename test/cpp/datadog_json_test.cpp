@@ -274,6 +274,98 @@ int main() {
 		Require(EstimateDatadogIntakeLogBytes(DatadogIntakeLog()) > 0,
 		        "byte estimate should include a fixed per-log envelope");
 
+		// --- Spans search body (read_datadog_traces) ------------------------------------------
+		auto spans_body = BuildDatadogSpansSearchBody("service:web", "now-15m", "now", "timestamp", 1000, "");
+		Require(
+		    spans_body ==
+		        R"({"data":{"type":"search_request","attributes":{"filter":{"query":"service:web","from":"now-15m","to":"now"},"sort":"timestamp","page":{"limit":1000}}}})",
+		    "spans search body should wrap filter/sort/page in the search_request envelope");
+		auto spans_cursor_body = BuildDatadogSpansSearchBody("*", "0", "10", "-timestamp", 25, "cursor123");
+		Require(spans_cursor_body.find("\"cursor\":\"cursor123\"") != string::npos,
+		        "a continuation cursor should be forwarded in the page object");
+		Require(spans_cursor_body.find("\"sort\":\"-timestamp\"") != string::npos,
+		        "descending spans sort should be forwarded");
+
+		// --- OTLP hex identifiers (write_datadog_traces) --------------------------------------
+		uint64_t low = 0;
+		string high;
+		Require(ParseDatadogHexId("00000000000000018", low, high) && low == 0x18ULL && high.empty(),
+		        "a 64-bit-or-smaller hex id should parse into the low word only");
+		Require(ParseDatadogHexId("463ac35c9f6413ad48485a3953bb6124", low, high), "a 128-bit id should parse");
+		Require(low == 0x48485a3953bb6124ULL, "the lower 64 bits should become the agent trace id");
+		Require(high == "463ac35c9f6413ad", "the upper 64 bits should become the _dd.p.tid hex tag");
+		Require(ParseDatadogHexId("0x00000000000000ff0000000000000001", low, high) && low == 1 && high == "ff",
+		        "a 0x prefix should be accepted and leading tid zeros stripped");
+		Require(ParseDatadogHexId("ABCDEF", low, high) && low == 0xABCDEFULL && high.empty(),
+		        "uppercase hex digits should be accepted");
+		Require(!ParseDatadogHexId("", low, high), "an empty id should be rejected");
+		Require(!ParseDatadogHexId("not-hex", low, high), "non-hex characters should be rejected");
+		Require(!ParseDatadogHexId("463ac35c9f6413ad48485a3953bb61241", low, high),
+		        "ids longer than 128 bits should be rejected");
+
+		// --- Trace agent body (write_datadog_traces) ------------------------------------------
+		DatadogAgentSpan root_span;
+		root_span.trace_id = 100;
+		root_span.span_id = 1;
+		root_span.service = "web-store";
+		root_span.name = "http.request";
+		root_span.resource = "GET /users";
+		root_span.type = "web";
+		root_span.start_ns = 1750000000000000000;
+		root_span.duration_ns = 250000000;
+		root_span.meta.emplace_back("span.kind", "server");
+		root_span.span_attributes_json = R"({"http.method":"GET","http.status_code":200,"cache.hit":true})";
+		root_span.resource_attributes_json = R"({"host":"web-01","http.method":"should-not-win"})";
+
+		DatadogAgentSpan child_span;
+		child_span.trace_id = 100;
+		child_span.span_id = 2;
+		child_span.has_parent_id = true;
+		child_span.parent_id = 1;
+		child_span.service = "web-store";
+		child_span.name = "db.query";
+		child_span.resource = "SELECT users";
+		child_span.error = true;
+		child_span.meta.emplace_back("error.message", "connection refused");
+
+		DatadogAgentSpan other_trace;
+		other_trace.trace_id = 100;                         // same low bits as root_span...
+		other_trace.trace_id_high_hex = "463ac35c9f6413ad"; // ...but a different 128-bit trace
+		other_trace.span_id = 3;
+		other_trace.service = "checkout";
+		other_trace.name = "process";
+
+		idx_t trace_count = 0;
+		auto traces_body = BuildDatadogAgentTracesBody({root_span, child_span, other_trace}, trace_count);
+		Require(trace_count == 2, "spans should group into traces; 128-bit ids must not merge by low bits alone");
+		Require(traces_body.find("\"trace_id\":100") != string::npos &&
+		            traces_body.find("\"span_id\":2") != string::npos,
+		        "agent ids should be emitted as unsigned integers");
+		Require(traces_body.find("\"parent_id\":1") != string::npos, "a parent id should be forwarded");
+		Require(traces_body.rfind("[[", 0) == 0, "the body should be an array of traces (arrays of spans)");
+		Require(traces_body.find("\"error\":1") != string::npos, "an errored span should carry error: 1");
+		Require(traces_body.find("\"error.message\":\"connection refused\"") != string::npos,
+		        "reserved meta entries should be emitted");
+		Require(traces_body.find("\"_dd.p.tid\":\"463ac35c9f6413ad\"") != string::npos,
+		        "the upper 64 bits of a 128-bit trace id should ride in meta _dd.p.tid");
+		Require(traces_body.find("\"http.method\":\"GET\"") != string::npos,
+		        "string span attributes should merge into meta");
+		Require(traces_body.find("should-not-win") == string::npos,
+		        "resource attributes must never overwrite an already-set meta key");
+		Require(traces_body.find("\"host\":\"web-01\"") != string::npos,
+		        "non-colliding resource attributes should merge into meta");
+		Require(traces_body.find("\"metrics\":{\"http.status_code\":200") != string::npos,
+		        "numeric span attributes should merge into metrics");
+		Require(traces_body.find("\"cache.hit\":\"true\"") != string::npos,
+		        "boolean attributes should become meta strings");
+		Require(traces_body.find("\"start\":1750000000000000000") != string::npos &&
+		            traces_body.find("\"duration\":250000000") != string::npos,
+		        "start and duration should be emitted in nanoseconds");
+
+		idx_t empty_trace_count = 123;
+		Require(BuildDatadogAgentTracesBody(nullptr, 0, empty_trace_count) == "[]" && empty_trace_count == 0,
+		        "an empty span batch should produce an empty trace array");
+
 		// Aggregation request bodies carry the filter, exactly one compute, and per-facet group-bys.
 		auto agg_body = BuildDatadogLogsAggregateBody("service:web @duration_ns:>=100", "now-1h", "now", "cardinality",
 		                                              "@trace_id", {"service", "status"}, 25);
@@ -299,8 +391,7 @@ int main() {
 		            agg_total[0].value == 0,
 		        "an ungrouped total should carry an empty group object");
 
-		auto agg_null =
-		    ParseDatadogLogsAggregateResponse(R"({"data":{"buckets":[{"by":{},"computes":{"c0":null}}]}})");
+		auto agg_null = ParseDatadogLogsAggregateResponse(R"({"data":{"buckets":[{"by":{},"computes":{"c0":null}}]}})");
 		Require(agg_null.size() == 1 && !agg_null[0].has_value,
 		        "a null compute (e.g. a percentile over zero logs) should have no value");
 

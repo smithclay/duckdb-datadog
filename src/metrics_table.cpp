@@ -11,18 +11,306 @@
 #include <chrono>
 #include <cstdlib>
 using namespace duckdb_yyjson; // NOLINT
-namespace duckdb { namespace {
-struct DD {void operator()(yyjson_doc*d)const{yyjson_doc_free(d);}}; struct SD {void operator()(char*p)const{free(p);}}; using Doc=std::unique_ptr<yyjson_doc,DD>;using Str=std::unique_ptr<char,SD>;
-constexpr idx_t T=0,N=2,U=4,D=6,SVC=7,SNS=8,SID=9,R=10,A=14;
-struct Point{int64_t time;double value;string metric,scope,unit,tags,series;};struct Bind:TableFunctionData{string query,from="now-15m",to="now";int64_t max=0;DatadogClient client;};struct State:GlobalTableFunctionState{vector<column_t>cols;std::deque<Point>points;bool loaded=false;idx_t emitted=0;idx_t MaxThreads()const override{return 1;}};
-static string W(yyjson_val*v){size_t n=0;Str s(yyjson_val_write(v,0,&n));return s?string(s.get(),n):string();}static string G(yyjson_val*o,const char*k){auto v=o?yyjson_obj_get(o,k):nullptr;return v&&yyjson_is_str(v)?string(yyjson_get_str(v),yyjson_get_len(v)):string();}
-static string Tag(yyjson_val*tags,const char*const*keys){if(!tags||!yyjson_is_arr(tags))return {};size_t i,n;yyjson_val*t;yyjson_arr_foreach(tags,i,n,t){if(!yyjson_is_str(t))continue;string x=yyjson_get_str(t);for(auto k=keys;*k;k++){string p=string(*k)+":";if(StringUtil::StartsWith(x,p))return x.substr(p.size());}}return {};}
-static string Obj(const Point&p){ // preserve provider metadata compactly without losing duplicate tags
- string out="{\"tags\":"+p.tags+",\"scope\":"; auto esc=[](const string&s){string x="\"";for(auto c:s){if(c=='\\' || c=='\"')x+='\\';x+=c;}return x+"\"";};out+=esc(p.scope)+",\"metric\":"+esc(p.metric)+",\"series\":"+p.series; if(!p.unit.empty())out+=",\"unit\":"+esc(p.unit);return out+"}";}
-static string Resource(const Bind&b,yyjson_val*tags){const char* keys[]={"host",nullptr};auto host=Tag(tags,keys);string x="{\"datadog.site\":\""+b.client.site+"\"";if(!host.empty())x+=",\"host\":\""+host+"\"";return x+"}";}
-static void Load(ClientContext&c,const Bind&b,State&s){auto body=b.client.QueryMetrics(c,b.query,std::stoll(b.from),std::stoll(b.to));Doc doc(yyjson_read(body.c_str(),body.size(),0));if(!doc)throw IOException("Datadog metrics returned invalid JSON");auto root=yyjson_doc_get_root(doc.get());auto series=yyjson_obj_get(root,"series");if(!series||!yyjson_is_arr(series))throw IOException("Datadog metrics response has no series array");size_t i,n;yyjson_val*q;yyjson_arr_foreach(series,i,n,q){auto metric=G(q,"metric");auto scope=G(q,"scope");auto tags=yyjson_obj_get(q,"tag_set");if(metric.empty())throw IOException("Datadog metrics response has a series without metric");auto points=yyjson_obj_get(q,"pointlist");if(!points||!yyjson_is_arr(points))throw IOException("Datadog metrics response has malformed pointlist");auto units=yyjson_obj_get(root,"unit");string unit;if(units&&yyjson_is_arr(units)&&yyjson_arr_size(units)){auto u=yyjson_arr_get(units,0);unit=G(u,"short_name");if(unit.empty())unit=G(u,"name");}size_t j,m;yyjson_val*x;yyjson_arr_foreach(points,j,m,x){if(!yyjson_is_arr(x)||yyjson_arr_size(x)!=2)throw IOException("Datadog metrics response has malformed point tuple");auto tv=yyjson_arr_get(x,0);auto vv=yyjson_arr_get(x,1);if(!tv||!yyjson_is_num(tv))throw IOException("Datadog metrics response has malformed point timestamp");if(!vv||yyjson_is_null(vv))continue;if(!yyjson_is_num(vv))throw IOException("Datadog metrics response has nonnumeric point value");Point p;p.time=int64_t(yyjson_get_real(tv)*1000000.0);p.value=yyjson_get_real(vv);p.metric=metric;p.scope=scope;p.unit=unit;p.tags=tags?W(tags):"[]";p.series=W(q);s.points.push_back(std::move(p));}}s.loaded=true;}
-static void Map(const Bind&b,const State&s,const Point&p,DataChunk&o,idx_t row){Doc d(yyjson_read(p.tags.c_str(),p.tags.size(),0));auto tags=d?yyjson_doc_get_root(d.get()):nullptr;const char*service[]={"service",nullptr};const char*ns[]={"service.namespace","service_namespace",nullptr};const char*id[]={"service.instance.id","service_instance_id",nullptr};for(idx_t i=0;i<s.cols.size();i++){o.SetValue(i,row,Value());switch(s.cols[i]){case T:o.SetValue(i,row,Value::TIMESTAMPNS(timestamp_ns_t(p.time)));break;case N:o.SetValue(i,row,Value(p.metric));break;case U:if(!p.unit.empty())o.SetValue(i,row,Value(p.unit));break;case D:o.SetValue(i,row,Value::DOUBLE(p.value));break;case SVC:{auto v=Tag(tags,service);if(!v.empty())o.SetValue(i,row,Value(v));break;}case SNS:{auto v=Tag(tags,ns);if(!v.empty())o.SetValue(i,row,Value(v));break;}case SID:{auto v=Tag(tags,id);if(!v.empty())o.SetValue(i,row,Value(v));break;}case R:o.SetValue(i,row,Value(Resource(b,tags)));break;case A:o.SetValue(i,row,Value(Obj(p)));break;default:break;}}}
-static int64_t Resolve(const string&v,int64_t now,const char*p){string x=v;StringUtil::Trim(x);if(StringUtil::CIEquals(x,"now"))return now;if(StringUtil::StartsWith(x,"now-"))x=x.substr(3);if(x.size()>2&&x[0]=='-'){auto z=x.back();int64_t m=z=='s'?1:z=='m'?60:z=='h'?3600:z=='d'?86400:0;char*e=nullptr;auto k=strtoll(x.substr(1,x.size()-2).c_str(),&e,10);if(m&&e&&!*e&&k>=0)return now-k*m;}char*e=nullptr;auto n=strtoll(x.c_str(),&e,10);if(e&&!*e&&n>=0)return n;throw InvalidInputException("read_datadog_metrics: invalid %s '%s'",p,v);}
-static unique_ptr<FunctionData> B(ClientContext&c,TableFunctionBindInput&i,vector<LogicalType>&t,vector<string>&n){auto b=make_uniq<Bind>();string sec;for(auto&p:i.named_parameters){if(p.second.IsNull())continue;auto k=StringUtil::Lower(p.first);if(k=="query")b->query=p.second.ToString();else if(k=="from")b->from=p.second.ToString();else if(k=="to")b->to=p.second.ToString();else if(k=="max_rows")b->max=p.second.GetValue<int64_t>();else if(k=="retries")b->client.retries=p.second.GetValue<int64_t>();else if(k=="timeout")b->client.timeout_seconds=p.second.GetValue<int64_t>();else if(k=="secret")sec=p.second.ToString();}StringUtil::Trim(b->query);if(b->query.empty()||b->max<0||b->client.timeout_seconds<1||b->client.retries>100)throw InvalidInputException("read_datadog_metrics: query must be nonempty and limits must be valid");auto now=std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();auto from=Resolve(b->from,now,"from"),to=Resolve(b->to,now,"to");if(from>to)throw InvalidInputException("read_datadog_metrics: from must not be later than to");b->from=std::to_string(from);b->to=std::to_string(to);auto creds=GetDatadogCredentials(c,sec);b->client.site=creds.site;b->client.api_key=creds.api_key;b->client.app_key=creds.app_key;n={"time_unix_nano","start_time_unix_nano","name","description","unit","int_value","double_value","service_name","service_namespace","service_instance_id","resource_attributes","scope_name","scope_version","scope_attributes","metric_attributes","flags","exemplars_json"};t={LogicalType::TIMESTAMP_NS,LogicalType::TIMESTAMP_NS,LogicalType::VARCHAR,LogicalType::VARCHAR,LogicalType::VARCHAR,LogicalType::BIGINT,LogicalType::DOUBLE,LogicalType::VARCHAR,LogicalType::VARCHAR,LogicalType::VARCHAR,LogicalType::VARCHAR,LogicalType::VARCHAR,LogicalType::VARCHAR,LogicalType::VARCHAR,LogicalType::VARCHAR,LogicalType::INTEGER,LogicalType::VARCHAR};return b;}
-static unique_ptr<GlobalTableFunctionState>I(ClientContext&,TableFunctionInitInput&i){auto s=make_uniq<State>();s->cols=i.column_ids;return s;}static void Scan(ClientContext&c,TableFunctionInput&i,DataChunk&o){auto&b=i.bind_data->Cast<Bind>();auto&s=i.global_state->Cast<State>();if(!s.loaded)Load(c,b,s);idx_t n=0;while(n<STANDARD_VECTOR_SIZE&&!s.points.empty()&&(b.max==0||s.emitted<idx_t(b.max))){Map(b,s,s.points.front(),o,n++);s.points.pop_front();s.emitted++;}o.SetCardinality(n);}
-} void RegisterDatadogMetricsFunction(ExtensionLoader&l){TableFunction f("read_datadog_metrics",{},Scan,B,I);f.named_parameters["query"]=LogicalType::VARCHAR;f.named_parameters["from"]=LogicalType::VARCHAR;f.named_parameters["to"]=LogicalType::VARCHAR;f.named_parameters["max_rows"]=LogicalType::BIGINT;f.named_parameters["retries"]=LogicalType::BIGINT;f.named_parameters["timeout"]=LogicalType::BIGINT;f.named_parameters["secret"]=LogicalType::VARCHAR;f.projection_pushdown=true;l.RegisterFunction(f);}}
+namespace duckdb {
+namespace {
+struct DD {
+	void operator()(yyjson_doc *d) const {
+		yyjson_doc_free(d);
+	}
+};
+struct SD {
+	void operator()(char *p) const {
+		free(p);
+	}
+};
+using Doc = std::unique_ptr<yyjson_doc, DD>;
+using Str = std::unique_ptr<char, SD>;
+constexpr idx_t T = 0, N = 2, U = 4, D = 6, SVC = 7, SNS = 8, SID = 9, R = 10, A = 14;
+struct Point {
+	int64_t time;
+	double value;
+	string metric, scope, unit, tags, series;
+};
+struct Bind : TableFunctionData {
+	string query, from = "now-15m", to = "now";
+	int64_t max = 0;
+	DatadogClient client;
+};
+struct State : GlobalTableFunctionState {
+	vector<column_t> cols;
+	std::deque<Point> points;
+	bool loaded = false;
+	idx_t emitted = 0;
+	idx_t MaxThreads() const override {
+		return 1;
+	}
+};
+static string W(yyjson_val *v) {
+	size_t n = 0;
+	Str s(yyjson_val_write(v, 0, &n));
+	return s ? string(s.get(), n) : string();
+}
+static string G(yyjson_val *o, const char *k) {
+	auto v = o ? yyjson_obj_get(o, k) : nullptr;
+	return v && yyjson_is_str(v) ? string(yyjson_get_str(v), yyjson_get_len(v)) : string();
+}
+static string Tag(yyjson_val *tags, const char *const *keys) {
+	if (!tags || !yyjson_is_arr(tags))
+		return {};
+	size_t i, n;
+	yyjson_val *t;
+	yyjson_arr_foreach(tags, i, n, t) {
+		if (!yyjson_is_str(t))
+			continue;
+		string x = yyjson_get_str(t);
+		for (auto k = keys; *k; k++) {
+			string p = string(*k) + ":";
+			if (StringUtil::StartsWith(x, p))
+				return x.substr(p.size());
+		}
+	}
+	return {};
+}
+static string Obj(const Point &p) { // preserve provider metadata compactly without losing duplicate tags
+	string out = "{\"tags\":" + p.tags + ",\"scope\":";
+	auto esc = [](const string &s) {
+		string x = "\"";
+		for (auto c : s) {
+			if (c == '\\' || c == '\"')
+				x += '\\';
+			x += c;
+		}
+		return x + "\"";
+	};
+	out += esc(p.scope) + ",\"metric\":" + esc(p.metric) + ",\"series\":" + p.series;
+	if (!p.unit.empty())
+		out += ",\"unit\":" + esc(p.unit);
+	return out + "}";
+}
+static string Resource(const Bind &b, yyjson_val *tags) {
+	const char *keys[] = {"host", nullptr};
+	auto host = Tag(tags, keys);
+	string x = "{\"datadog.site\":\"" + b.client.site + "\"";
+	if (!host.empty())
+		x += ",\"host\":\"" + host + "\"";
+	return x + "}";
+}
+static void Load(ClientContext &c, const Bind &b, State &s) {
+	auto body = b.client.QueryMetrics(c, b.query, std::stoll(b.from), std::stoll(b.to));
+	Doc doc(yyjson_read(body.c_str(), body.size(), 0));
+	if (!doc)
+		throw IOException("Datadog metrics returned invalid JSON");
+	auto root = yyjson_doc_get_root(doc.get());
+	auto series = yyjson_obj_get(root, "series");
+	if (!series || !yyjson_is_arr(series))
+		throw IOException("Datadog metrics response has no series array");
+	size_t i, n;
+	yyjson_val *q;
+	yyjson_arr_foreach(series, i, n, q) {
+		auto metric = G(q, "metric");
+		auto scope = G(q, "scope");
+		auto tags = yyjson_obj_get(q, "tag_set");
+		if (metric.empty())
+			throw IOException("Datadog metrics response has a series without metric");
+		auto points = yyjson_obj_get(q, "pointlist");
+		if (!points || !yyjson_is_arr(points))
+			throw IOException("Datadog metrics response has malformed pointlist");
+		auto units = yyjson_obj_get(root, "unit");
+		string unit;
+		if (units && yyjson_is_arr(units) && yyjson_arr_size(units)) {
+			auto u = yyjson_arr_get(units, 0);
+			unit = G(u, "short_name");
+			if (unit.empty())
+				unit = G(u, "name");
+		}
+		size_t j, m;
+		yyjson_val *x;
+		yyjson_arr_foreach(points, j, m, x) {
+			if (!yyjson_is_arr(x) || yyjson_arr_size(x) != 2)
+				throw IOException("Datadog metrics response has malformed point tuple");
+			auto tv = yyjson_arr_get(x, 0);
+			auto vv = yyjson_arr_get(x, 1);
+			if (!tv || !yyjson_is_num(tv))
+				throw IOException("Datadog metrics response has malformed point timestamp");
+			if (!vv || yyjson_is_null(vv))
+				continue;
+			if (!yyjson_is_num(vv))
+				throw IOException("Datadog metrics response has nonnumeric point value");
+			Point p;
+			p.time = int64_t(yyjson_get_real(tv) * 1000000.0);
+			p.value = yyjson_get_real(vv);
+			p.metric = metric;
+			p.scope = scope;
+			p.unit = unit;
+			p.tags = tags ? W(tags) : "[]";
+			p.series = W(q);
+			s.points.push_back(std::move(p));
+		}
+	}
+	s.loaded = true;
+}
+static void Map(const Bind &b, const State &s, const Point &p, DataChunk &o, idx_t row) {
+	Doc d(yyjson_read(p.tags.c_str(), p.tags.size(), 0));
+	auto tags = d ? yyjson_doc_get_root(d.get()) : nullptr;
+	const char *service[] = {"service", nullptr};
+	const char *ns[] = {"service.namespace", "service_namespace", nullptr};
+	const char *id[] = {"service.instance.id", "service_instance_id", nullptr};
+	for (idx_t i = 0; i < s.cols.size(); i++) {
+		o.SetValue(i, row, Value());
+		switch (s.cols[i]) {
+		case T:
+			o.SetValue(i, row, Value::TIMESTAMPNS(timestamp_ns_t(p.time)));
+			break;
+		case N:
+			o.SetValue(i, row, Value(p.metric));
+			break;
+		case U:
+			if (!p.unit.empty())
+				o.SetValue(i, row, Value(p.unit));
+			break;
+		case D:
+			o.SetValue(i, row, Value::DOUBLE(p.value));
+			break;
+		case SVC: {
+			auto v = Tag(tags, service);
+			if (!v.empty())
+				o.SetValue(i, row, Value(v));
+			break;
+		}
+		case SNS: {
+			auto v = Tag(tags, ns);
+			if (!v.empty())
+				o.SetValue(i, row, Value(v));
+			break;
+		}
+		case SID: {
+			auto v = Tag(tags, id);
+			if (!v.empty())
+				o.SetValue(i, row, Value(v));
+			break;
+		}
+		case R:
+			o.SetValue(i, row, Value(Resource(b, tags)));
+			break;
+		case A:
+			o.SetValue(i, row, Value(Obj(p)));
+			break;
+		default:
+			break;
+		}
+	}
+}
+static int64_t Resolve(const string &v, int64_t now, const char *p) {
+	string x = v;
+	StringUtil::Trim(x);
+	if (StringUtil::CIEquals(x, "now"))
+		return now;
+	if (StringUtil::StartsWith(x, "now-"))
+		x = x.substr(3);
+	if (x.size() > 2 && x[0] == '-') {
+		auto z = x.back();
+		int64_t m = z == 's' ? 1 : z == 'm' ? 60 : z == 'h' ? 3600 : z == 'd' ? 86400 : 0;
+		char *e = nullptr;
+		auto k = strtoll(x.substr(1, x.size() - 2).c_str(), &e, 10);
+		if (m && e && !*e && k >= 0)
+			return now - k * m;
+	}
+	char *e = nullptr;
+	auto n = strtoll(x.c_str(), &e, 10);
+	if (e && !*e && n >= 0)
+		return n;
+	throw InvalidInputException("read_datadog_metrics: invalid %s '%s'", p, v);
+}
+static unique_ptr<FunctionData> B(ClientContext &c, TableFunctionBindInput &i, vector<LogicalType> &t,
+                                  vector<string> &n) {
+	auto b = make_uniq<Bind>();
+	string sec;
+	for (auto &p : i.named_parameters) {
+		if (p.second.IsNull())
+			continue;
+		auto k = StringUtil::Lower(p.first);
+		if (k == "query")
+			b->query = p.second.ToString();
+		else if (k == "from")
+			b->from = p.second.ToString();
+		else if (k == "to")
+			b->to = p.second.ToString();
+		else if (k == "max_rows")
+			b->max = p.second.GetValue<int64_t>();
+		else if (k == "retries")
+			b->client.retries = p.second.GetValue<int64_t>();
+		else if (k == "timeout")
+			b->client.timeout_seconds = p.second.GetValue<int64_t>();
+		else if (k == "secret")
+			sec = p.second.ToString();
+	}
+	StringUtil::Trim(b->query);
+	if (b->query.empty() || b->max < 0 || b->client.timeout_seconds < 1 || b->client.retries > 100)
+		throw InvalidInputException("read_datadog_metrics: query must be nonempty and limits must be valid");
+	auto now =
+	    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+	auto from = Resolve(b->from, now, "from"), to = Resolve(b->to, now, "to");
+	if (from > to)
+		throw InvalidInputException("read_datadog_metrics: from must not be later than to");
+	b->from = std::to_string(from);
+	b->to = std::to_string(to);
+	auto creds = GetDatadogCredentials(c, sec);
+	b->client.site = creds.site;
+	b->client.api_key = creds.api_key;
+	b->client.app_key = creds.app_key;
+	n = {"time_unix_nano",
+	     "start_time_unix_nano",
+	     "name",
+	     "description",
+	     "unit",
+	     "int_value",
+	     "double_value",
+	     "service_name",
+	     "service_namespace",
+	     "service_instance_id",
+	     "resource_attributes",
+	     "scope_name",
+	     "scope_version",
+	     "scope_attributes",
+	     "metric_attributes",
+	     "flags",
+	     "exemplars_json"};
+	t = {LogicalType::TIMESTAMP_NS, LogicalType::TIMESTAMP_NS, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	     LogicalType::VARCHAR,      LogicalType::BIGINT,       LogicalType::DOUBLE,  LogicalType::VARCHAR,
+	     LogicalType::VARCHAR,      LogicalType::VARCHAR,      LogicalType::VARCHAR, LogicalType::VARCHAR,
+	     LogicalType::VARCHAR,      LogicalType::VARCHAR,      LogicalType::VARCHAR, LogicalType::INTEGER,
+	     LogicalType::VARCHAR};
+	return b;
+}
+static unique_ptr<GlobalTableFunctionState> I(ClientContext &, TableFunctionInitInput &i) {
+	auto s = make_uniq<State>();
+	s->cols = i.column_ids;
+	return s;
+}
+static void Scan(ClientContext &c, TableFunctionInput &i, DataChunk &o) {
+	auto &b = i.bind_data->Cast<Bind>();
+	auto &s = i.global_state->Cast<State>();
+	if (!s.loaded)
+		Load(c, b, s);
+	idx_t n = 0;
+	while (n < STANDARD_VECTOR_SIZE && !s.points.empty() && (b.max == 0 || s.emitted < idx_t(b.max))) {
+		Map(b, s, s.points.front(), o, n++);
+		s.points.pop_front();
+		s.emitted++;
+	}
+	o.SetCardinality(n);
+}
+} // namespace
+void RegisterDatadogMetricsFunction(ExtensionLoader &l) {
+	TableFunction f("read_datadog_metrics", {}, Scan, B, I);
+	f.named_parameters["query"] = LogicalType::VARCHAR;
+	f.named_parameters["from"] = LogicalType::VARCHAR;
+	f.named_parameters["to"] = LogicalType::VARCHAR;
+	f.named_parameters["max_rows"] = LogicalType::BIGINT;
+	f.named_parameters["retries"] = LogicalType::BIGINT;
+	f.named_parameters["timeout"] = LogicalType::BIGINT;
+	f.named_parameters["secret"] = LogicalType::VARCHAR;
+	f.projection_pushdown = true;
+	l.RegisterFunction(f);
+}
+} // namespace duckdb

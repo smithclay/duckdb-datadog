@@ -610,3 +610,114 @@ SELECT count(*) FROM duckdb_secrets() WHERE name = 'dd_intake' AND secret_string
 
 statement ok
 DROP SECRET dd_intake;
+
+# --- read_datadog_traces / write_datadog_traces (offline) ---------------------
+
+query II
+SELECT count(*) FILTER (WHERE function_name = 'read_datadog_traces') >= 1,
+       count(*) FILTER (WHERE function_name = 'write_datadog_traces') >= 1
+FROM duckdb_functions();
+----
+true	true
+
+# Named parameters are validated before credentials are resolved.
+statement error
+SELECT * FROM read_datadog_traces(page_size => 0);
+----
+page_size must be between 1 and 1000
+
+statement error
+SELECT * FROM read_datadog_traces(max_rows => -1);
+----
+max_rows must be >= 0
+
+statement error
+SELECT * FROM read_datadog_traces(sort => 'newest');
+----
+sort must be either 'timestamp' or '-timestamp'
+
+statement error
+SELECT * FROM read_datadog_traces(timeout => 0);
+----
+timeout must be >= 1
+
+# All secrets were dropped above, so binding the reader fails with guidance (no network call).
+statement error
+SELECT * FROM read_datadog_traces();
+----
+No 'datadog' secret found
+
+# The trace writer targets a (local) Datadog Agent, which needs no credentials: it binds without
+# any datadog secret in scope (bind only; nothing is sent).
+query I
+SELECT column_type FROM (DESCRIBE SELECT write_datadog_traces({'trace_id': 'ab12', 'span_id': 'cd34'}));
+----
+VARCHAR
+
+# ...but the input struct must at least identify a span.
+statement error
+DESCRIBE SELECT write_datadog_traces({'name': 'orphan'});
+----
+must contain trace_id and span_id
+
+statement error
+DESCRIBE SELECT write_datadog_traces('not a struct');
+----
+must be a STRUCT
+
+# An explicitly named secret must still exist.
+statement error
+DESCRIBE SELECT write_datadog_traces({'trace_id': 'ab', 'span_id': 'cd'}, 'no_such_secret');
+----
+No secret with name 'no_such_secret' found
+
+# The secret accepts a trace-agent override; like intake_url it is configuration, not a credential.
+statement ok
+CREATE SECRET dd_traces (
+    TYPE datadog,
+    API_KEY 'API_KEY_VALUE',
+    APP_KEY 'APP_KEY_VALUE',
+    TRACE_AGENT_URL 'http://127.0.0.1:8136'
+);
+
+query I
+SELECT count(*) FROM duckdb_secrets() WHERE name = 'dd_traces' AND secret_string LIKE '%127.0.0.1:8136%';
+----
+1
+
+# With a secret present, the reader binds and exposes the 24-column duckdb-otlp traces schema
+# (bind only; the spans API is called only when the scan runs).
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_datadog_traces(query => '*', "from" => 'now-15m', "to" => 'now'));
+----
+24
+
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_datadog_traces())
+WHERE column_name IN ('start_time_unix_nano', 'duration_time_unix_nano', 'trace_id', 'span_id', 'parent_span_id',
+                      'service_name', 'name', 'kind', 'status_code', 'status_status_message',
+                      'resource_attributes', 'span_attributes', 'events_json', 'links_json', 'flags');
+----
+15
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_datadog_traces())
+WHERE column_name IN ('start_time_unix_nano', 'duration_time_unix_nano', 'kind') ORDER BY column_name;
+----
+duration_time_unix_nano	BIGINT
+kind	INTEGER
+start_time_unix_nano	TIMESTAMP_NS
+
+# Planning is network-free and surfaces the request parameters.
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM read_datadog_traces(sort => '-timestamp', max_rows => 50);
+----
+physical_plan	<REGEX>:.*"Datadog Sort": "-timestamp".*"Datadog Max Rows": "50".*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM read_datadog_traces();
+----
+physical_plan	<REGEX>:.*"Datadog Query": "[*]".*"Datadog From": "now-15m".*"Datadog To": "now".*"Datadog Sort": "timestamp".*"Datadog Page Size": "1000".*"Datadog Max Rows": "0".*"Datadog Retries": "4".*"Datadog Timeout": "60".*
+
+statement ok
+DROP SECRET dd_traces;

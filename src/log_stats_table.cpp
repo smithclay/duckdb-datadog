@@ -40,10 +40,10 @@ struct DatadogLogStatsBindData : public TableFunctionData {
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<DatadogLogStatsBindData>();
-		return query == other.query && from == other.from && to == other.to &&
-		       aggregation == other.aggregation && metric == other.metric && group_by == other.group_by &&
-		       group_limit == other.group_limit && client.site == other.client.site &&
-		       client.api_key == other.client.api_key && client.app_key == other.client.app_key;
+		return query == other.query && from == other.from && to == other.to && aggregation == other.aggregation &&
+		       metric == other.metric && group_by == other.group_by && group_limit == other.group_limit &&
+		       client.site == other.client.site && client.api_key == other.client.api_key &&
+		       client.app_key == other.client.app_key;
 	}
 };
 

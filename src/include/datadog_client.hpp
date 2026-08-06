@@ -30,6 +30,11 @@ struct DatadogClient {
 	//! bare origin or a full intake URL (a trailing /api/v2/logs is stripped), so the value
 	//! `datadog_serve()` returns can be pasted verbatim.
 	string intake_url;
+	//! Base URL of the Datadog Agent's trace API used by write_datadog_traces (default:
+	//! http://localhost:8126). Accepts a bare origin or a full URL (a trailing /v0.3/traces is
+	//! stripped). Traces are sent to a local Agent rather than directly to Datadog because the
+	//! backend trace intake has no public JSON API.
+	string trace_agent_url;
 	//! Per-request connection/read timeout.
 	uint64_t timeout_seconds = 60;
 	//! Retry budget for transient failures: HTTP 429 (waits the server-advised delay from
@@ -60,6 +65,10 @@ struct DatadogClient {
 	//! InterruptException if the query was cancelled. Successive calls reuse the same HTTP
 	//! connection.
 	string SearchLogs(ClientContext &context, const string &request_body_json) const;
+	//! POST `request_body_json` to /api/v2/spans/events/search and return the raw response body.
+	//! Authentication, connection pooling, retries, backoff, cancellation, and TLS behavior are
+	//! shared with SearchLogs; the spans search API paginates through the same cursor scheme.
+	string SearchSpans(ClientContext &context, const string &request_body_json) const;
 	//! POST `request_body_json` to /api/v2/logs/analytics/aggregate and return the raw response
 	//! body. Authentication, retries, backoff, cancellation, and TLS behavior are shared with
 	//! SearchLogs; one aggregation request replaces a paginated scan for count-style questions.
@@ -88,6 +97,15 @@ struct DatadogClient {
 	//! successful send returns HTTP 202. Native builds gzip the request body and may run several
 	//! sends concurrently, each on its own pooled connection.
 	string SendLogs(ClientContext &context, const string &intake_body_json) const;
+
+	//! PUT `traces_body_json` (a JSON array of traces, each an array of spans) to the Datadog
+	//! Agent's trace API at http://localhost:8126/v0.3/traces (or the trace_agent_url override).
+	//! The local Agent needs no authentication; DD-API-KEY is attached only when an api_key is
+	//! configured so an override pointing at a keyed proxy still works. `trace_count` fills the
+	//! X-Datadog-Trace-Count header the Agent uses for sampling bookkeeping. Like SendLogs, only
+	//! pre-send transport failures are retried — the endpoint is not idempotent. Each call uses a
+	//! fresh connection: the Agent is local, so per-request connection setup is negligible.
+	string SendTraces(ClientContext &context, const string &traces_body_json, idx_t trace_count) const;
 
 private:
 #ifndef __EMSCRIPTEN__

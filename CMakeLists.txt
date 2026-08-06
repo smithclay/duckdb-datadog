@@ -37,8 +37,10 @@ set(EXTENSION_SOURCES src/datadog_extension.cpp src/datadog_secret.cpp
                       src/alerts_table.cpp
 					  src/metrics_table.cpp
                       src/service_dependencies_table.cpp
+                      src/traces_table.cpp
                       src/datadog_catalog.cpp
-                      src/send_logs.cpp src/datadog_server.cpp)
+                      src/send_logs.cpp src/write_traces.cpp
+                      src/datadog_server.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

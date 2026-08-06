@@ -1,6 +1,7 @@
 #include "metrics_table.hpp"
 #include "datadog_client.hpp"
 #include "datadog_secret.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/timestamp.hpp"
@@ -34,11 +35,16 @@ struct Point {
 struct Bind : TableFunctionData {
 	string query, from = "now-15m", to = "now";
 	int64_t max = 0;
+	//! Catalog-backed scans keep relative windows verbatim and resolve them (and require a
+	//! configured query) only when the scan starts, mirroring the service_map table.
+	bool lazy_window = false;
+	TableCatalogEntry *table = nullptr;
 	DatadogClient client;
 };
 struct State : GlobalTableFunctionState {
 	vector<column_t> cols;
 	std::deque<Point> points;
+	int64_t from_s = 0, to_s = 0;
 	bool loaded = false;
 	idx_t emitted = 0;
 	idx_t MaxThreads() const override {
@@ -96,7 +102,7 @@ static string Resource(const Bind &b, yyjson_val *tags) {
 	return x + "}";
 }
 static void Load(ClientContext &c, const Bind &b, State &s) {
-	auto body = b.client.QueryMetrics(c, b.query, std::stoll(b.from), std::stoll(b.to));
+	auto body = b.client.QueryMetrics(c, b.query, s.from_s, s.to_s);
 	Doc doc(yyjson_read(body.c_str(), body.size(), 0));
 	if (!doc)
 		throw IOException("Datadog metrics returned invalid JSON");
@@ -258,6 +264,52 @@ static unique_ptr<FunctionData> B(ClientContext &c, TableFunctionBindInput &i, v
 	b->client.site = creds.site;
 	b->client.api_key = creds.api_key;
 	b->client.app_key = creds.app_key;
+	GetDatadogMetricsSchema(t, n);
+	return b;
+}
+static unique_ptr<GlobalTableFunctionState> I(ClientContext &, TableFunctionInitInput &i) {
+	auto s = make_uniq<State>();
+	s->cols = i.column_ids;
+	auto &b = i.bind_data->Cast<Bind>();
+	if (b.lazy_window) {
+		// Catalog-backed scan: the query requirement and the window resolve only now, so an
+		// attachment without metrics configuration still binds and DESCRIBEs offline.
+		if (b.query.empty())
+			throw InvalidInputException("Datadog metrics are not configured: ATTACH with METRICS_QUERY "
+			                            "'avg:system.cpu.user{*}', or use read_datadog_metrics(query => ...)");
+		auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+		               .count();
+		s->from_s = Resolve(b.from, now, "from");
+		s->to_s = Resolve(b.to, now, "to");
+		if (s->from_s > s->to_s)
+			throw InvalidInputException("Datadog metrics window METRICS_START_TIME must not be later than "
+			                            "METRICS_END_TIME");
+	} else {
+		s->from_s = std::stoll(b.from);
+		s->to_s = std::stoll(b.to);
+	}
+	return s;
+}
+static void Scan(ClientContext &c, TableFunctionInput &i, DataChunk &o) {
+	auto &b = i.bind_data->Cast<Bind>();
+	auto &s = i.global_state->Cast<State>();
+	if (!s.loaded)
+		Load(c, b, s);
+	idx_t n = 0;
+	while (n < STANDARD_VECTOR_SIZE && !s.points.empty() && (b.max == 0 || s.emitted < idx_t(b.max))) {
+		Map(b, s, s.points.front(), o, n++);
+		s.points.pop_front();
+		s.emitted++;
+	}
+	o.SetCardinality(n);
+}
+static BindInfo MetricsBindInfo(const optional_ptr<FunctionData> bind_data) {
+	auto &b = bind_data->Cast<Bind>();
+	D_ASSERT(b.table);
+	return BindInfo(*b.table);
+}
+} // namespace
+void GetDatadogMetricsSchema(vector<LogicalType> &t, vector<string> &n) {
 	n = {"time_unix_nano",
 	     "start_time_unix_nano",
 	     "name",
@@ -280,27 +332,7 @@ static unique_ptr<FunctionData> B(ClientContext &c, TableFunctionBindInput &i, v
 	     LogicalType::VARCHAR,      LogicalType::VARCHAR,      LogicalType::VARCHAR, LogicalType::VARCHAR,
 	     LogicalType::VARCHAR,      LogicalType::VARCHAR,      LogicalType::VARCHAR, LogicalType::INTEGER,
 	     LogicalType::VARCHAR};
-	return b;
 }
-static unique_ptr<GlobalTableFunctionState> I(ClientContext &, TableFunctionInitInput &i) {
-	auto s = make_uniq<State>();
-	s->cols = i.column_ids;
-	return s;
-}
-static void Scan(ClientContext &c, TableFunctionInput &i, DataChunk &o) {
-	auto &b = i.bind_data->Cast<Bind>();
-	auto &s = i.global_state->Cast<State>();
-	if (!s.loaded)
-		Load(c, b, s);
-	idx_t n = 0;
-	while (n < STANDARD_VECTOR_SIZE && !s.points.empty() && (b.max == 0 || s.emitted < idx_t(b.max))) {
-		Map(b, s, s.points.front(), o, n++);
-		s.points.pop_front();
-		s.emitted++;
-	}
-	o.SetCardinality(n);
-}
-} // namespace
 void RegisterDatadogMetricsFunction(ExtensionLoader &l) {
 	TableFunction f("read_datadog_metrics", {}, Scan, B, I);
 	f.named_parameters["query"] = LogicalType::VARCHAR;
@@ -312,5 +344,28 @@ void RegisterDatadogMetricsFunction(ExtensionLoader &l) {
 	f.named_parameters["secret"] = LogicalType::VARCHAR;
 	f.projection_pushdown = true;
 	l.RegisterFunction(f);
+}
+TableFunction GetDatadogMetricsTableScan(ClientContext &c, TableCatalogEntry &table, const string &secret_name,
+                                         const DatadogMetricsSettings &settings, unique_ptr<FunctionData> &bind_data) {
+	auto b = make_uniq<Bind>();
+	b->query = settings.query;
+	StringUtil::Trim(b->query);
+	b->from = settings.from;
+	b->to = settings.to;
+	b->max = settings.max_rows;
+	b->lazy_window = true;
+	b->table = &table;
+	b->client.retries = static_cast<uint64_t>(settings.retries);
+	b->client.timeout_seconds = static_cast<uint64_t>(settings.timeout_seconds);
+	auto creds = GetDatadogCredentials(c, secret_name);
+	b->client.site = creds.site;
+	b->client.api_key = creds.api_key;
+	b->client.app_key = creds.app_key;
+	bind_data = std::move(b);
+
+	TableFunction f("datadog_metrics_scan", {}, Scan, nullptr, I);
+	f.projection_pushdown = true;
+	f.get_bind_info = MetricsBindInfo;
+	return f;
 }
 } // namespace duckdb

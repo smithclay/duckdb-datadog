@@ -69,6 +69,12 @@ SELECT * FROM dd.alerts.open ORDER BY last_triggered_at DESC;
 
 -- One row per directed caller -> callee edge from the latest hour.
 SELECT * FROM dd.service_map.dependencies;
+
+-- Indexed spans (last 15 minutes) in the duckdb-otlp trace schema.
+SELECT * FROM dd.traces.spans WHERE service_name = 'checkout';
+
+-- Timeseries points for the attachment's METRICS_QUERY.
+SELECT * FROM dd.metrics.series;
 ```
 
 Without `INDEXES`, `ATTACH` calls Datadog's log-index configuration endpoint once and caches the
@@ -155,6 +161,37 @@ FROM read_datadog_service_dependencies(
 `-15m` and `now-1h` (units: `s`, `m`, `h`, `d`, or `w`). Optional `secret`, `retries`, and `timeout`
 parameters follow `read_datadog_logs`. The API response supplies topology but not per-edge types or
 statistics, so those canonical columns are `NULL` for Datadog.
+
+### Traces and metrics tables
+
+`dd.traces.spans` exposes indexed spans through the same scanner as
+[`read_datadog_traces`](#reading-spans): the 24-column duckdb-otlp schema over the reader's
+defaults (query `*`, `now-15m` to `now`, and the attachment's `SORT`/`PAGE_SIZE`/`MAX_ROWS`/
+`RETRIES`/`TIMEOUT`). Supported `WHERE` predicates are translated conservatively — a
+`service_name = '...'` equality becomes a `service:` search term and `start_time_unix_nano`
+bounds tighten an absolute window — with the original predicates always retained as DuckDB
+residual filters. Use `read_datadog_traces` for a custom span query or relative window.
+
+`dd.metrics.series` runs the attachment's metrics query through the same scanner as
+`read_datadog_metrics`:
+
+```sql
+ATTACH 'datadog:' AS dd (
+    TYPE datadog,
+    SECRET 'dd_prod',
+    INDEXES ['main'],
+    METRICS_QUERY 'avg:system.cpu.user{*} by {host}',
+    METRICS_START_TIME '-1h',   -- default now-15m
+    METRICS_END_TIME 'now'
+);
+
+SELECT time_unix_nano, name, double_value, service_name
+FROM dd.metrics.series;
+```
+
+Like the service map, the metrics table is lazy: it binds and `DESCRIBE`s without configuration
+and raises a focused `METRICS_QUERY` error only when scanned, and relative windows are resolved
+when each scan starts, so a long-lived attachment keeps returning the latest window.
 
 Both interfaces return the same schema, making provider maps easy to combine with
 `UNION ALL BY NAME`: `provider`, `source_service`, `target_service`, `source_type`, `target_type`, `edge_type`,

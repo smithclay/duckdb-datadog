@@ -717,7 +717,7 @@ physical_plan	<REGEX>:.*"Datadog Sort": "-timestamp".*"Datadog Max Rows": "50".*
 query II
 EXPLAIN (FORMAT JSON) SELECT * FROM read_datadog_traces();
 ----
-physical_plan	<REGEX>:.*"Datadog Query": "[*]".*"Datadog From": "now-15m".*"Datadog To": "now".*"Datadog Sort": "timestamp".*"Datadog Page Size": "1000".*"Datadog Max Rows": "0".*"Datadog Retries": "4".*"Datadog Timeout": "60".*
+physical_plan	<REGEX>:.*"Datadog Query": "[*]".*"Datadog Sort": "timestamp".*"Datadog Page Size": "1000".*"Datadog Max Rows": "0".*"Datadog Retries": "4".*"Datadog Timeout": "60".*
 
 statement ok
 DROP SECRET dd_traces;
@@ -773,3 +773,101 @@ VARCHAR
 
 statement ok
 DROP SECRET dd_direct;
+
+# --- traces + metrics catalog schemas -----------------------------------------
+
+statement ok
+CREATE SECRET dd_cat (TYPE datadog, API_KEY 'k', APP_KEY 'a');
+
+statement ok
+ATTACH 'datadog:' AS ddc (TYPE datadog, SECRET 'dd_cat', INDEXES ['main']);
+
+query II
+SELECT count(*) FILTER (WHERE schema_name = 'traces'), count(*) FILTER (WHERE schema_name = 'metrics')
+FROM duckdb_schemas() WHERE database_name = 'ddc';
+----
+1	1
+
+query II
+SELECT count(*) FILTER (WHERE schema_name = 'traces' AND table_name = 'spans'),
+       count(*) FILTER (WHERE schema_name = 'metrics' AND table_name = 'series')
+FROM duckdb_tables() WHERE database_name = 'ddc';
+----
+1	1
+
+# Catalog tables and the table functions expose exactly the same columns and types.
+query I
+SELECT count(*) FROM (
+    (SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM ddc.traces.spans))
+    EXCEPT ALL
+    (SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_datadog_traces()))
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM ddc.metrics.series))
+    EXCEPT ALL
+    (SELECT column_name, column_type
+     FROM (DESCRIBE SELECT * FROM read_datadog_metrics(query => 'avg:system.cpu.user{*}')))
+);
+----
+0
+
+# Supported WHERE predicates are translated for the spans table without executing a network
+# request; the residual filter stays in DuckDB.
+query II
+EXPLAIN (FORMAT JSON) SELECT name FROM ddc.traces.spans WHERE service_name = 'edge';
+----
+physical_plan	<REGEX>:.*"Datadog Query": "service:edge".*
+
+# ...and the same pushdown serves the plain table function.
+query II
+EXPLAIN (FORMAT JSON) SELECT name FROM read_datadog_traces() WHERE service_name = 'edge';
+----
+physical_plan	<REGEX>:.*"Datadog Query": "service:edge".*
+
+# Without METRICS_QUERY the metrics table binds and DESCRIBEs; the focused configuration error
+# occurs only when it is executed.
+statement error
+SELECT * FROM ddc.metrics.series;
+----
+METRICS_QUERY
+
+# The new schemas are read-only like the rest of the catalog.
+statement error
+CREATE TABLE ddc.traces.nope(i INTEGER);
+----
+read-only
+
+statement error
+INSERT INTO ddc.metrics.series (name) VALUES ('nope');
+----
+read-only
+
+statement ok
+DETACH ddc;
+
+# Metrics ATTACH options are validated at attach and threaded into the lazy scan window.
+statement error
+ATTACH 'datadog:' AS ddm_bad (TYPE datadog, SECRET 'dd_cat', INDEXES ['main'], METRICS_QUERY '');
+----
+METRICS_QUERY must not be empty
+
+statement ok
+ATTACH 'datadog:' AS ddm (
+    TYPE datadog, SECRET 'dd_cat', INDEXES ['main'],
+    METRICS_QUERY 'avg:system.cpu.user{*}', METRICS_START_TIME '-2h'
+);
+
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM ddm.metrics.series);
+----
+17
+
+statement ok
+DETACH ddm;
+
+statement ok
+DROP SECRET dd_cat;

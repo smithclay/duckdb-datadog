@@ -547,6 +547,7 @@ static void AddDatadogQueryTerm(DatadogFilterPushdown &pushdown, string term) {
 }
 
 static void TryPushDatadogComparison(const LogicalGet &get, const BoundComparisonExpression &comparison,
+                                     const string &time_column, const vector<std::pair<string, string>> &facet_columns,
                                      DatadogFilterPushdown &pushdown) {
 	const BoundColumnRefExpression *column = nullptr;
 	const BoundConstantExpression *constant = nullptr;
@@ -576,17 +577,22 @@ static void TryPushDatadogComparison(const LogicalGet &get, const BoundCompariso
 		return;
 	}
 	const auto &column_name = get.names[source_column];
-	if ((column_name == "service_name" || column_name == "severity_text") &&
-	    comparison_type == ExpressionType::COMPARE_EQUAL && constant->value.type().id() == LogicalTypeId::VARCHAR) {
+	for (const auto &facet : facet_columns) {
+		if (column_name != facet.first) {
+			continue;
+		}
+		if (comparison_type != ExpressionType::COMPARE_EQUAL || constant->value.type().id() != LogicalTypeId::VARCHAR) {
+			return;
+		}
 		auto value = constant->value.GetValue<string>();
 		if (!IsSafeDatadogFacetValue(value)) {
 			return;
 		}
-		AddDatadogQueryTerm(pushdown, (column_name == "service_name" ? "service:" : "status:") + value);
+		AddDatadogQueryTerm(pushdown, facet.second + ":" + value);
 		return;
 	}
 
-	if (column_name != "time_unix_nano" || constant->value.type().id() != LogicalTypeId::TIMESTAMP_NS) {
+	if (column_name != time_column || constant->value.type().id() != LogicalTypeId::TIMESTAMP_NS) {
 		return;
 	}
 	auto nanos = constant->value.GetValue<timestamp_ns_t>().value;
@@ -614,10 +620,12 @@ static void TryPushDatadogComparison(const LogicalGet &get, const BoundCompariso
 	}
 }
 
-static void TryPushDatadogExpression(const LogicalGet &get, const Expression &expression,
+static void TryPushDatadogExpression(const LogicalGet &get, const Expression &expression, const string &time_column,
+                                     const vector<std::pair<string, string>> &facet_columns,
                                      DatadogFilterPushdown &pushdown) {
 	if (expression.GetExpressionClass() == ExpressionClass::BOUND_COMPARISON) {
-		TryPushDatadogComparison(get, expression.Cast<BoundComparisonExpression>(), pushdown);
+		TryPushDatadogComparison(get, expression.Cast<BoundComparisonExpression>(), time_column, facet_columns,
+		                         pushdown);
 		return;
 	}
 	if (expression.GetExpressionClass() != ExpressionClass::BOUND_CONJUNCTION ||
@@ -625,8 +633,19 @@ static void TryPushDatadogExpression(const LogicalGet &get, const Expression &ex
 		return;
 	}
 	for (const auto &child : expression.Cast<BoundConjunctionExpression>().children) {
-		TryPushDatadogExpression(get, *child, pushdown);
+		TryPushDatadogExpression(get, *child, time_column, facet_columns, pushdown);
 	}
+}
+
+void CollectDatadogSearchPushdown(const LogicalGet &get, const vector<unique_ptr<Expression>> &filters,
+                                  const string &time_column, const vector<std::pair<string, string>> &facet_columns,
+                                  DatadogFilterPushdown &pushdown) {
+	for (const auto &filter : filters) {
+		TryPushDatadogExpression(get, *filter, time_column, facet_columns, pushdown);
+	}
+	// The caller deliberately leaves every expression in `filters`. DuckDB retains a residual
+	// filter above the scan, guaranteeing exact SQL semantics even if Datadog's search behavior
+	// or timestamp precision is broader than DuckDB's.
 }
 
 static void DatadogLogsPushdownComplexFilter(ClientContext &, LogicalGet &get, FunctionData *bind_data,
@@ -638,12 +657,8 @@ static void DatadogLogsPushdownComplexFilter(ClientContext &, LogicalGet &get, F
 	if (bind.max_rows > 0) {
 		return;
 	}
-	for (const auto &filter : filters) {
-		TryPushDatadogExpression(get, *filter, bind.pushdown);
-	}
-	// Deliberately leave every expression in `filters`. DuckDB retains a residual
-	// filter above the scan, guaranteeing exact SQL semantics even if Datadog's
-	// search behavior or timestamp precision is broader than DuckDB's.
+	CollectDatadogSearchPushdown(get, filters, "time_unix_nano",
+	                             {{"service_name", "service"}, {"severity_text", "status"}}, bind.pushdown);
 }
 
 static InsertionOrderPreservingMap<string> DatadogLogsToString(TableFunctionToStringInput &input) {

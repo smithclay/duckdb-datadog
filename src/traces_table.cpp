@@ -5,11 +5,13 @@
 #include "datadog_secret.hpp"
 #include "logs_table.hpp"
 
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 
 #include "yyjson.hpp"
 
@@ -428,6 +430,8 @@ struct DatadogTracesBindData : public TableFunctionData {
 	string sort = "timestamp";
 	int64_t page_size = 1000; // rows per API request (Datadog max)
 	int64_t max_rows = 0;     // 0 = unlimited
+	DatadogFilterPushdown pushdown;
+	TableCatalogEntry *table = nullptr;
 	DatadogClient client;
 };
 
@@ -439,6 +443,10 @@ struct DatadogTracesGlobalState : public GlobalTableFunctionState {
 	std::deque<vector<Value>> buffer;
 	//! Next-page cursor from meta.page.after ("" = request the first page).
 	string cursor;
+	//! Effective request values after conservative WHERE pushdown is resolved.
+	string request_query;
+	string request_from;
+	string request_to;
 	//! Sum of requested page limits; reserving the row budget when a request is sent
 	//! guarantees PAGE_SIZE >= MAX_ROWS cannot trigger another cursor request.
 	idx_t row_budget_used = 0;
@@ -454,7 +462,8 @@ struct DatadogTracesGlobalState : public GlobalTableFunctionState {
 static void FetchNextPage(ClientContext &context, const DatadogTracesBindData &bind, DatadogTracesGlobalState &state) {
 	auto page_limit = GetDatadogLogsPageLimit(bind.page_size, bind.max_rows, state.row_budget_used);
 	D_ASSERT(page_limit > 0);
-	string body = BuildDatadogSpansSearchBody(bind.query, bind.from, bind.to, bind.sort, page_limit, state.cursor);
+	string body = BuildDatadogSpansSearchBody(state.request_query, state.request_from, state.request_to, bind.sort,
+	                                          page_limit, state.cursor);
 	string response = bind.client.SearchSpans(context, body);
 	state.row_budget_used += static_cast<idx_t>(page_limit);
 
@@ -540,7 +549,13 @@ static unique_ptr<FunctionData> DatadogTracesBind(ClientContext &context, TableF
 static unique_ptr<GlobalTableFunctionState> DatadogTracesInitGlobal(ClientContext &context,
                                                                     TableFunctionInitInput &input) {
 	auto state = make_uniq<DatadogTracesGlobalState>();
+	auto &bind = input.bind_data->Cast<DatadogTracesBindData>();
 	state->column_ids = input.column_ids;
+	auto resolved = ResolveDatadogSearch(bind.query, bind.from, bind.to, bind.pushdown);
+	state->request_query = std::move(resolved.query);
+	state->request_from = std::move(resolved.from);
+	state->request_to = std::move(resolved.to);
+	state->finished = resolved.empty;
 	return std::move(state);
 }
 
@@ -583,19 +598,47 @@ static void DatadogTracesScan(ClientContext &context, TableFunctionInput &data_p
 	output.SetCardinality(count);
 }
 
+static void DatadogTracesPushdownComplexFilter(ClientContext &, LogicalGet &get, FunctionData *bind_data,
+                                               vector<unique_ptr<Expression>> &filters) {
+	auto &bind = bind_data->Cast<DatadogTracesBindData>();
+	bind.pushdown = DatadogFilterPushdown();
+	// max_rows caps the unfiltered table-function input. Moving a WHERE predicate below that cap
+	// changes which rows participate, so no remote filters are valid for a capped scan.
+	if (bind.max_rows > 0) {
+		return;
+	}
+	CollectDatadogSearchPushdown(get, filters, "start_time_unix_nano", {{"service_name", "service"}}, bind.pushdown);
+}
+
 static InsertionOrderPreservingMap<string> DatadogTracesToString(TableFunctionToStringInput &input) {
 	InsertionOrderPreservingMap<string> result;
 	auto &bind = input.bind_data->Cast<DatadogTracesBindData>();
+	auto resolved = ResolveDatadogSearch(bind.query, bind.from, bind.to, bind.pushdown);
 	result["Function"] = input.table_function.name;
-	result["Datadog Query"] = bind.query;
-	result["Datadog From"] = bind.from;
-	result["Datadog To"] = bind.to;
+	result["Datadog Query"] = resolved.query;
 	result["Datadog Sort"] = bind.sort;
 	result["Datadog Page Size"] = std::to_string(bind.page_size);
 	result["Datadog Max Rows"] = std::to_string(bind.max_rows);
 	result["Datadog Retries"] = std::to_string(bind.client.retries);
 	result["Datadog Timeout"] = std::to_string(bind.client.timeout_seconds);
+	if (resolved.from != bind.from) {
+		result["Datadog From"] = resolved.from;
+	}
+	if (resolved.to != bind.to) {
+		result["Datadog To"] = resolved.to;
+	}
 	return result;
+}
+
+//! Shared function options for read_datadog_traces and the catalog-backed spans table.
+static void ConfigureDatadogTracesFunction(TableFunction &function) {
+	// Only projected columns are mapped from the API response; the network cost is unchanged, but
+	// e.g. a count(*) or a GROUP BY service_name never pays the per-row span_attributes JSON
+	// serialization.
+	function.projection_pushdown = true;
+	function.pushdown_complex_filter = DatadogTracesPushdownComplexFilter;
+	function.filter_pushdown = false; // translated predicates always remain as DuckDB residual filters
+	function.to_string = DatadogTracesToString;
 }
 
 void RegisterDatadogTracesFunction(ExtensionLoader &loader) {
@@ -609,12 +652,35 @@ void RegisterDatadogTracesFunction(ExtensionLoader &loader) {
 	function.named_parameters["retries"] = LogicalType::BIGINT;
 	function.named_parameters["timeout"] = LogicalType::BIGINT;
 	function.named_parameters["secret"] = LogicalType::VARCHAR;
-	// Only projected columns are mapped from the API response; the network cost is unchanged, but
-	// e.g. a count(*) or a GROUP BY service_name never pays the per-row span_attributes JSON
-	// serialization.
-	function.projection_pushdown = true;
-	function.to_string = DatadogTracesToString;
+	ConfigureDatadogTracesFunction(function);
 	loader.RegisterFunction(function);
+}
+
+static BindInfo DatadogTracesGetBindInfo(const optional_ptr<FunctionData> bind_data) {
+	auto &data = bind_data->Cast<DatadogTracesBindData>();
+	D_ASSERT(data.table);
+	return BindInfo(*data.table);
+}
+
+TableFunction GetDatadogTracesTableScan(ClientContext &context, TableCatalogEntry &table, const string &secret_name,
+                                        const DatadogLogsSettings &settings, unique_ptr<FunctionData> &bind_data) {
+	auto result = make_uniq<DatadogTracesBindData>();
+	result->table = &table;
+	result->sort = settings.sort;
+	result->page_size = settings.page_size;
+	result->max_rows = settings.max_rows;
+	result->client.retries = static_cast<uint64_t>(settings.retries);
+	result->client.timeout_seconds = static_cast<uint64_t>(settings.timeout_seconds);
+	auto credentials = GetDatadogCredentials(context, secret_name);
+	result->client.site = credentials.site;
+	result->client.api_key = credentials.api_key;
+	result->client.app_key = credentials.app_key;
+	bind_data = std::move(result);
+
+	TableFunction function("datadog_traces_scan", {}, DatadogTracesScan, nullptr, DatadogTracesInitGlobal);
+	ConfigureDatadogTracesFunction(function);
+	function.get_bind_info = DatadogTracesGetBindInfo;
+	return function;
 }
 
 } // namespace duckdb

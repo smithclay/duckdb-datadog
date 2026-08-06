@@ -300,6 +300,13 @@ string DatadogClient::SearchLogs(ClientContext &context, const string &request_b
 	return AuthenticatedRequest(context, "/api/v2/logs/events/search", &request_body_json, false);
 }
 
+string DatadogClient::QueryMetrics(ClientContext &context, const string &query, int64_t from, int64_t to) const {
+	static constexpr char HEX[] = "0123456789ABCDEF";
+	string encoded;
+	for (auto ch : query) { auto c = static_cast<unsigned char>(ch); if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') encoded += char(c); else { encoded += '%'; encoded += HEX[c >> 4]; encoded += HEX[c & 15]; } }
+	return AuthenticatedRequest(context, "/api/v1/query?from=" + std::to_string(from) + "&to=" + std::to_string(to) + "&query=" + encoded, nullptr, false);
+}
+
 string DatadogClient::SearchOpenAlerts(ClientContext &context, int64_t page, int64_t per_page) const {
 	auto path = BuildDatadogOpenAlertsPath(page, per_page);
 	return AuthenticatedRequest(context, path, nullptr, false);

@@ -55,6 +55,8 @@ struct DatadogClient {
 	//! InterruptException if the query was cancelled. Successive calls reuse the same HTTP
 	//! connection.
 	string SearchLogs(ClientContext &context, const string &request_body_json) const;
+	//! GET one v1 metrics query window; the query text is percent-encoded by the client.
+	string QueryMetrics(ClientContext &context, const string &query, int64_t from, int64_t to) const;
 
 	//! GET one page of currently triggered monitor groups (Alert, Warn, or No Data) from
 	//! /api/v1/monitor/groups/search. The returned JSON is parsed by the catalog table scan.

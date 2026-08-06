@@ -5,6 +5,7 @@
 #include "datadog_catalog.hpp"
 #include "datadog_secret.hpp"
 #include "datadog_server.hpp"
+#include "log_stats_table.hpp"
 #include "logs_table.hpp"
 #include "metrics_table.hpp"
 #include "send_logs.hpp"
@@ -22,6 +23,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RegisterDatadogCatalog(loader);
 	// Reader: SELECT * FROM read_datadog_logs(query => '...', "from" => 'now-1h', "to" => 'now').
 	RegisterDatadogLogsFunction(loader);
+	// Aggregations: SELECT * FROM read_datadog_log_stats(query => '...', compute => 'count', ...).
+	RegisterDatadogLogStatsFunction(loader);
 	RegisterDatadogMetricsFunction(loader);
 	// Service topology: SELECT * FROM read_datadog_service_dependencies(env => 'prod', ...).
 	RegisterDatadogServiceDependenciesFunction(loader);

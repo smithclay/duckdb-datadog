@@ -559,3 +559,54 @@ DETACH dd_default;
 
 statement ok
 DROP SECRET dd_other;
+
+# --- read_datadog_log_stats (offline) ----------------------------------------
+
+query I
+SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'read_datadog_log_stats';
+----
+true
+
+# Parameters are validated before credentials are resolved.
+statement error
+SELECT * FROM read_datadog_log_stats(query => '*', compute => 'cardinality');
+----
+requires metric
+
+statement error
+SELECT * FROM read_datadog_log_stats(query => '*', group_limit => 0);
+----
+group_limit must be between 1 and 10000
+
+statement error
+SELECT * FROM read_datadog_log_stats(query => '*', group_by => ['']);
+----
+must be non-empty
+
+statement error
+SELECT * FROM read_datadog_log_stats(query => '*', timeout => 0);
+----
+timeout must be >= 1
+
+# All secrets were dropped above, so binding fails with guidance (no network call).
+statement error
+SELECT * FROM read_datadog_log_stats(query => '*');
+----
+No 'datadog' secret found
+
+# The secret accepts an intake-URL override; it is configuration, not a credential.
+statement ok
+CREATE SECRET dd_intake (
+    TYPE datadog,
+    API_KEY 'API_KEY_VALUE',
+    APP_KEY 'APP_KEY_VALUE',
+    INTAKE_URL 'http://127.0.0.1:55520'
+);
+
+query I
+SELECT count(*) FROM duckdb_secrets() WHERE name = 'dd_intake' AND secret_string LIKE '%127.0.0.1:55520%';
+----
+1
+
+statement ok
+DROP SECRET dd_intake;

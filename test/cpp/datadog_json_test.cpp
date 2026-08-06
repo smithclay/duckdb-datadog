@@ -273,6 +273,46 @@ int main() {
 		        "byte estimate should scale with field sizes");
 		Require(EstimateDatadogIntakeLogBytes(DatadogIntakeLog()) > 0,
 		        "byte estimate should include a fixed per-log envelope");
+
+		// Aggregation request bodies carry the filter, exactly one compute, and per-facet group-bys.
+		auto agg_body = BuildDatadogLogsAggregateBody("service:web @duration_ns:>=100", "now-1h", "now", "cardinality",
+		                                              "@trace_id", {"service", "status"}, 25);
+		Require(agg_body ==
+		            "{\"filter\":{\"query\":\"service:web @duration_ns:>=100\",\"from\":\"now-1h\",\"to\":\"now\"},"
+		            "\"compute\":[{\"aggregation\":\"cardinality\",\"metric\":\"@trace_id\"}],"
+		            "\"group_by\":[{\"facet\":\"service\",\"limit\":25},{\"facet\":\"status\",\"limit\":25}]}",
+		        "aggregate body should carry filter, one compute, and per-facet group-bys");
+		auto count_body = BuildDatadogLogsAggregateBody("*", "0", "10", "count", "", {}, 10);
+		Require(count_body.find("metric") == string::npos, "a plain count carries no metric field");
+		Require(count_body.find("group_by") == string::npos, "no group_by field without facets");
+
+		auto agg_buckets = ParseDatadogLogsAggregateResponse(
+		    R"({"data":{"buckets":[{"by":{"service":"payment"},"computes":{"c0":42}},)"
+		    R"({"by":{"service":"web"},"computes":{"c0":7.5}}]}})");
+		Require(agg_buckets.size() == 2, "every aggregation bucket should be returned");
+		Require(agg_buckets[0].by_json == "{\"service\":\"payment\"}", "group keys should round-trip as JSON");
+		Require(agg_buckets[0].has_value && agg_buckets[0].value == 42, "integer computes should be parsed");
+		Require(agg_buckets[1].has_value && agg_buckets[1].value == 7.5, "fractional computes should be parsed");
+
+		auto agg_total = ParseDatadogLogsAggregateResponse(R"({"data":{"buckets":[{"computes":{"c0":0}}]}})");
+		Require(agg_total.size() == 1 && agg_total[0].by_json == "{}" && agg_total[0].has_value &&
+		            agg_total[0].value == 0,
+		        "an ungrouped total should carry an empty group object");
+
+		auto agg_null =
+		    ParseDatadogLogsAggregateResponse(R"({"data":{"buckets":[{"by":{},"computes":{"c0":null}}]}})");
+		Require(agg_null.size() == 1 && !agg_null[0].has_value,
+		        "a null compute (e.g. a percentile over zero logs) should have no value");
+
+		Require(ParseDatadogLogsAggregateResponse(R"({"data":{}})").empty(),
+		        "a zero-match response without buckets is a valid empty result");
+		bool malformed_agg_rejected = false;
+		try {
+			ParseDatadogLogsAggregateResponse("not json");
+		} catch (const IOException &) {
+			malformed_agg_rejected = true;
+		}
+		Require(malformed_agg_rejected, "malformed aggregation responses should be rejected");
 	} catch (const std::exception &error) {
 		std::cerr << "datadog_json_test failed: " << error.what() << std::endl;
 		return 1;

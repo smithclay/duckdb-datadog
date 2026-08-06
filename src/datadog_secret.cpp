@@ -15,7 +15,8 @@ static unique_ptr<BaseSecret> CreateDatadogSecretFromConfig(ClientContext &conte
 	// Only copy the keys we understand; ignore anything else.
 	for (const auto &option : input.options) {
 		auto lower_name = StringUtil::Lower(option.first);
-		if (lower_name == "api_key" || lower_name == "app_key" || lower_name == "site") {
+		if (lower_name == "api_key" || lower_name == "app_key" || lower_name == "site" ||
+		    lower_name == "intake_url") {
 			secret->secret_map[lower_name] = option.second;
 		}
 	}
@@ -36,6 +37,9 @@ void RegisterDatadogSecretType(ExtensionLoader &loader) {
 	datadog_secret_function.named_parameters["api_key"] = LogicalType::VARCHAR;
 	datadog_secret_function.named_parameters["app_key"] = LogicalType::VARCHAR;
 	datadog_secret_function.named_parameters["site"] = LogicalType::VARCHAR;
+	// Intake base URL override for send_datadog_logs: a local datadog_serve listener or an
+	// intake proxy. Not a credential, so it is not redacted.
+	datadog_secret_function.named_parameters["intake_url"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(datadog_secret_function);
 }
 
@@ -85,6 +89,9 @@ DatadogCredentials GetDatadogCredentials(ClientContext &context, const string &s
 	}
 	if (kv_secret->TryGetValue("site", value) && !value.IsNull() && !value.ToString().empty()) {
 		creds.site = value.ToString();
+	}
+	if (kv_secret->TryGetValue("intake_url", value) && !value.IsNull()) {
+		creds.intake_url = value.ToString();
 	}
 
 	if (creds.api_key.empty()) {

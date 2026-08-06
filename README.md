@@ -1,8 +1,8 @@
 # duckdb-datadog
 
 A DuckDB extension that reads logs, open monitor alerts, and APM service dependencies from Datadog
-directly into DuckDB, receives logs through a native intake server, and sends OTLP-shaped log
-tables back to Datadog.
+directly into DuckDB, runs server-side log aggregations (counts, cardinalities, percentiles),
+receives logs through a native intake server, and sends OTLP-shaped log tables back to Datadog.
 Log rows conform to the [duckdb-otlp](https://github.com/smithclay/otlp2records)
 `read_otlp_logs` schema, so Datadog logs drop straight into an OTLP-shaped lakehouse alongside
 data from other sources.
@@ -261,6 +261,58 @@ JSON — Datadog custom attributes); `dropped_attributes_count`, `flags` (INTEGE
 Because attribute columns are JSON strings, query them with DuckDB's JSON functions, e.g.
 `SELECT log_attributes->>'$.http.status_code' FROM logs`.
 
+## Aggregations
+
+`read_datadog_log_stats` asks the [Logs Aggregation API](https://docs.datadoghq.com/api/latest/logs/#aggregate-events)
+one question and returns its buckets, so a count over millions of logs costs one request instead
+of a paginated row scan. Reach for it for count-style questions; use `read_datadog_logs` when you
+need the rows themselves.
+
+```sql
+-- Error logs per service over the last hour.
+SELECT by->>'$.service' AS service, value::BIGINT AS errors
+FROM read_datadog_log_stats(
+    query    => 'status:error',
+    "from"   => 'now-1h',
+    "to"     => 'now',
+    compute  => 'count',
+    group_by => ['service'],
+    group_limit => 100
+);
+
+-- Distinct trace ids matching a filter (one cardinality request, no row transfer).
+SELECT value::BIGINT AS traces
+FROM read_datadog_log_stats(
+    query   => 'service:payment @duration_ns:>=4500000000',
+    "from"  => 'now-1h',
+    "to"    => 'now',
+    compute => 'cardinality',
+    metric  => '@trace_id'
+);
+```
+
+Each row is one bucket: `by` (VARCHAR) holds the group-by key values as a JSON object (`{}` for an
+ungrouped total) and `value` (DOUBLE) holds the computed number. `compute` accepts Datadog's
+aggregations (`count`, `cardinality`, `avg`, `sum`, `min`, `max`, `pc75`/`pc90`/`pc95`/`pc98`/`pc99`);
+everything except `count` needs `metric`, the `@attribute` facet to aggregate over. A null compute
+(e.g. a percentile over zero matching logs) is a SQL `NULL`. `value` is exact for counts up to
+2^53, far past any log volume the API will return.
+
+| Parameter     | Type      | Default    | Description |
+|---------------|-----------|------------|-------------|
+| `query`       | VARCHAR   | `*`        | Datadog log search query. |
+| `from`        | VARCHAR   | `now-15m`  | Start of the time window. |
+| `to`          | VARCHAR   | `now`      | End of the time window. |
+| `compute`     | VARCHAR   | `count`    | Datadog aggregation to compute. |
+| `metric`      | VARCHAR   | —          | Facet to aggregate (required unless `compute` is `count`). |
+| `group_by`    | VARCHAR[] | none       | Facets to group by. |
+| `group_limit` | BIGINT    | `10`       | Max buckets per facet (1–10000, the Datadog cap). |
+| `retries`, `timeout`, `secret` | | | Same behavior as `read_datadog_logs`. |
+
+Grouping and non-count aggregations follow Datadog's facet rules: an attribute generally needs a
+facet declared on it before it can appear in `metric` or `group_by`. Requires the
+`logs_read_data` permission.
+
 ## Receiving logs
 
 `datadog_serve` starts a native HTTP server inside DuckDB and returns its Datadog v2 intake URL.
@@ -394,8 +446,35 @@ Notes:
 - Datadog drops logs whose `timestamp` is more than ~18h in the past; when replaying old data,
   either omit the timestamp column or expect those logs not to be indexed.
 - A `NULL` log struct maps to a `NULL` result and is not sent.
-- Concurrency-safe: the function may run on multiple threads, and sends to the shared connection are
-  serialized internally.
+- Request bodies are gzip-compressed, and each projection thread sends on its own pooled
+  keep-alive connection, so large sends upload batches in parallel rather than serializing on
+  one socket. Note that parallel batches make the partial-failure window above wider, not
+  narrower — order of delivery across batches is not guaranteed.
+
+### Sending somewhere other than Datadog
+
+The optional `INTAKE_URL` secret field points `send_datadog_logs` at any v2-intake-compatible
+listener instead of `https://http-intake.logs.<site>`: a local `datadog_serve`, an intake proxy,
+or a mock in CI. It accepts a bare origin or a full intake URL (a trailing `/api/v2/logs` is
+stripped), so the value `datadog_serve()` returns can be pasted verbatim:
+
+```sql
+SELECT datadog_serve('datadog:127.0.0.1:10518', {table_name: 'received'});
+-- http://127.0.0.1:10518/api/v2/logs
+
+CREATE SECRET dd_local (
+    TYPE datadog,
+    API_KEY 'local-key',
+    APP_KEY 'unused-for-intake',
+    INTAKE_URL 'http://127.0.0.1:10518/api/v2/logs'
+);
+
+SELECT send_datadog_logs(l, 'dd_local') FROM my_logs l;
+SELECT count(*) FROM received;  -- the logs, round-tripped without leaving the process
+```
+
+This makes the whole send path testable offline; `test/sql/datadog_send_local.test` is exactly
+this loop. Reads (`read_datadog_logs` and friends) are unaffected by `INTAKE_URL`.
 
 ## Building
 

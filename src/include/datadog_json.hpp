@@ -98,6 +98,26 @@ DatadogResolvedSearch ResolveDatadogSearch(const string &query, const string &fr
 string BuildDatadogLogsSearchBody(const string &query, const string &from, const string &to, const string &sort,
                                   int64_t limit, const string &cursor, const vector<string> &indexes = {});
 
+//! One bucket returned by the Logs Aggregation API: the group-by key values as a JSON object
+//! (`{}` for an ungrouped total) and the single requested compute value. `has_value` is false
+//! when Datadog returns a null compute (e.g. a percentile over zero matching logs).
+struct DatadogLogStatsBucket {
+	string by_json = "{}";
+	bool has_value = false;
+	double value = 0;
+};
+
+//! Build the POST body for /api/v2/logs/analytics/aggregate: one compute (aggregation +
+//! optional metric) and zero or more group-by facets, each capped at `group_limit` buckets.
+//! The metric field is omitted when `metric` is empty (a plain count needs none).
+string BuildDatadogLogsAggregateBody(const string &query, const string &from, const string &to,
+                                     const string &aggregation, const string &metric,
+                                     const vector<string> &group_by, int64_t group_limit);
+
+//! Parse one aggregation response into buckets. A missing or empty bucket list is a valid
+//! zero-match result, not an error. Throws IOException on malformed JSON.
+vector<DatadogLogStatsBucket> ParseDatadogLogsAggregateResponse(const string &response_json);
+
 //! One OTLP-shaped log to send through the Datadog log intake API. Every string field is optional;
 //! an empty string means "absent" and the corresponding Datadog attribute is omitted. `host` and
 //! `ddtags` fall back to values discovered inside `resource_attributes_json` when left empty.

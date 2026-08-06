@@ -458,6 +458,90 @@ string BuildDatadogLogsSearchBody(const string &query, const string &from, const
 	return json ? string(json.get()) : string();
 }
 
+string BuildDatadogLogsAggregateBody(const string &query, const string &from, const string &to,
+                                     const string &aggregation, const string &metric,
+                                     const vector<string> &group_by, int64_t group_limit) {
+	YyjsonMutDocPtr doc(yyjson_mut_doc_new(nullptr));
+	auto root = yyjson_mut_obj(doc.get());
+	yyjson_mut_doc_set_root(doc.get(), root);
+
+	auto filter = yyjson_mut_obj(doc.get());
+	yyjson_mut_obj_add_strcpy(doc.get(), filter, "query", query.c_str());
+	yyjson_mut_obj_add_strcpy(doc.get(), filter, "from", from.c_str());
+	yyjson_mut_obj_add_strcpy(doc.get(), filter, "to", to.c_str());
+	yyjson_mut_obj_add_val(doc.get(), root, "filter", filter);
+
+	auto computes = yyjson_mut_arr(doc.get());
+	auto compute = yyjson_mut_obj(doc.get());
+	yyjson_mut_obj_add_strcpy(doc.get(), compute, "aggregation", aggregation.c_str());
+	if (!metric.empty()) {
+		yyjson_mut_obj_add_strcpy(doc.get(), compute, "metric", metric.c_str());
+	}
+	yyjson_mut_arr_add_val(computes, compute);
+	yyjson_mut_obj_add_val(doc.get(), root, "compute", computes);
+
+	if (!group_by.empty()) {
+		auto groups = yyjson_mut_arr(doc.get());
+		for (const auto &facet : group_by) {
+			auto group = yyjson_mut_obj(doc.get());
+			yyjson_mut_obj_add_strcpy(doc.get(), group, "facet", facet.c_str());
+			yyjson_mut_obj_add_int(doc.get(), group, "limit", group_limit);
+			yyjson_mut_arr_add_val(groups, group);
+		}
+		yyjson_mut_obj_add_val(doc.get(), root, "group_by", groups);
+	}
+
+	YyjsonStrPtr json(yyjson_mut_write(doc.get(), 0, nullptr));
+	return json ? string(json.get()) : string();
+}
+
+vector<DatadogLogStatsBucket> ParseDatadogLogsAggregateResponse(const string &response_json) {
+	YyjsonDocPtr doc(yyjson_read(response_json.c_str(), response_json.size(), 0));
+	if (!doc) {
+		throw IOException("Datadog aggregation API returned a response that is not valid JSON");
+	}
+	yyjson_val *root = yyjson_doc_get_root(doc.get());
+	yyjson_val *data = yyjson_obj_get(root, "data");
+	yyjson_val *buckets = data ? yyjson_obj_get(data, "buckets") : nullptr;
+
+	vector<DatadogLogStatsBucket> result;
+	if (!buckets || !yyjson_is_arr(buckets)) {
+		// A window with zero matching logs comes back without buckets; that is a
+		// valid empty result, not a protocol error.
+		return result;
+	}
+	size_t idx, max;
+	yyjson_val *bucket;
+	yyjson_arr_foreach(buckets, idx, max, bucket) {
+		if (!yyjson_is_obj(bucket)) {
+			throw IOException("Datadog aggregation API returned a malformed bucket");
+		}
+		DatadogLogStatsBucket row;
+		yyjson_val *by = yyjson_obj_get(bucket, "by");
+		if (by && yyjson_is_obj(by)) {
+			YyjsonStrPtr by_json(yyjson_val_write(by, 0, nullptr));
+			if (by_json) {
+				row.by_json = by_json.get();
+			}
+		}
+		yyjson_val *computes = yyjson_obj_get(bucket, "computes");
+		if (computes && yyjson_is_obj(computes)) {
+			// Exactly one compute is requested, so take the first entry (Datadog names it c0).
+			yyjson_obj_iter iter;
+			yyjson_obj_iter_init(computes, &iter);
+			if (yyjson_val *key = yyjson_obj_iter_next(&iter)) {
+				yyjson_val *value = yyjson_obj_iter_get_val(key);
+				if (value && yyjson_is_num(value)) {
+					row.has_value = true;
+					row.value = yyjson_get_num(value);
+				}
+			}
+		}
+		result.push_back(std::move(row));
+	}
+	return result;
+}
+
 //! Merge every key of the JSON object `source_json` into `dest` as a top-level custom attribute,
 //! skipping any key already present (reserved attributes set earlier always win). Non-object or
 //! unparseable input is silently ignored so a malformed attribute column never fails the send.

@@ -1,0 +1,67 @@
+# name: test/sql/datadog_send_local.test
+# description: hermetic send_datadog_logs -> datadog_serve round trip via the INTAKE_URL override
+# group: [sql]
+
+require datadog
+
+# Native sockets and worker threads are not available in wasm32 builds.
+require 64bit
+
+query T
+SELECT datadog_serve('datadog:127.0.0.1:55521', {table_name: 'roundtrip_logs'});
+----
+http://127.0.0.1:55521/api/v2/logs
+
+# The override accepts datadog_serve()'s return value verbatim: the trailing intake path is
+# stripped, so send and serve can be wired together by pasting one string.
+statement ok
+CREATE SECRET dd_local (
+    TYPE datadog,
+    API_KEY 'local-test-key',
+    APP_KEY 'unused-for-intake',
+    INTAKE_URL 'http://127.0.0.1:55521/api/v2/logs'
+);
+
+query T
+SELECT send_datadog_logs(l, 'dd_local')
+FROM (
+    SELECT * FROM (VALUES
+        ('checkout failed', 'payment', 'ERROR', 'trace-1', '{"duration_ns": "5000000000"}'),
+        ('checkout ok',     'payment', 'INFO',  'trace-2', '{"duration_ns": "120000"}')
+    ) t(body, service_name, severity_text, trace_id, log_attributes)
+) l;
+----
+ok
+ok
+
+# The server appends before answering 202, so the rows are immediately queryable. This also
+# proves the server decompresses the sender's gzip'd request body.
+query TTTT
+SELECT trace_id, service_name, severity_text, body FROM roundtrip_logs ORDER BY trace_id;
+----
+trace-1	payment	ERROR	checkout failed
+trace-2	payment	INFO	checkout ok
+
+query I
+SELECT count(*) FROM roundtrip_logs WHERE log_attributes LIKE '%duration_ns%';
+----
+2
+
+# A second statement reuses a pooled intake connection.
+query T
+SELECT send_datadog_logs({'body': 'second batch', 'service_name': 'payment'}, 'dd_local');
+----
+ok
+
+query I
+SELECT count(*) FROM roundtrip_logs;
+----
+3
+
+query T
+SELECT datadog_stop('datadog:127.0.0.1:55521');
+----
+stopped
+
+statement ok
+DROP SECRET dd_local;

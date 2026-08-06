@@ -33,7 +33,8 @@ include_directories(src/include)
 
 set(EXTENSION_SOURCES src/datadog_extension.cpp src/datadog_secret.cpp
                       src/datadog_client.cpp src/datadog_json.cpp
-                      src/logs_table.cpp src/alerts_table.cpp
+                      src/logs_table.cpp src/log_stats_table.cpp
+                      src/alerts_table.cpp
 					  src/metrics_table.cpp
                       src/service_dependencies_table.cpp
                       src/datadog_catalog.cpp

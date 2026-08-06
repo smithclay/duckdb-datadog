@@ -12,6 +12,9 @@ struct DatadogCredentials {
 	string api_key;
 	string app_key;
 	string site = "datadoghq.com";
+	//! Optional override for the log intake base URL (default: https://http-intake.logs.<site>).
+	//! Lets send_datadog_logs target a local `datadog_serve` listener or an intake proxy.
+	string intake_url;
 };
 
 //! Register the `datadog` secret type and its `config` provider so users can run:

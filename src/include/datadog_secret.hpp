@@ -18,6 +18,9 @@ struct DatadogCredentials {
 	//! Optional override for the Datadog Agent trace API base URL used by write_datadog_traces
 	//! (default: http://localhost:8126).
 	string trace_agent_url;
+	//! How write_datadog_traces reaches Datadog: "agent" (default) sends JSON to a Datadog Agent;
+	//! "direct" sends protobuf straight to the backend trace intake using API_KEY, no Agent needed.
+	string trace_intake;
 };
 
 //! Register the `datadog` secret type and its `config` provider so users can run:

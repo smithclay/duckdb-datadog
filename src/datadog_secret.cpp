@@ -16,7 +16,7 @@ static unique_ptr<BaseSecret> CreateDatadogSecretFromConfig(ClientContext &conte
 	for (const auto &option : input.options) {
 		auto lower_name = StringUtil::Lower(option.first);
 		if (lower_name == "api_key" || lower_name == "app_key" || lower_name == "site" || lower_name == "intake_url" ||
-		    lower_name == "trace_agent_url") {
+		    lower_name == "trace_agent_url" || lower_name == "trace_intake") {
 			secret->secret_map[lower_name] = option.second;
 		}
 	}
@@ -43,6 +43,9 @@ void RegisterDatadogSecretType(ExtensionLoader &loader) {
 	// Trace agent base URL override for write_datadog_traces (default: http://localhost:8126).
 	// Also configuration rather than a credential.
 	datadog_secret_function.named_parameters["trace_agent_url"] = LogicalType::VARCHAR;
+	// How write_datadog_traces reaches Datadog: 'agent' (default; JSON to a Datadog Agent) or
+	// 'direct' (protobuf straight to the backend trace intake; needs API_KEY, no Agent).
+	datadog_secret_function.named_parameters["trace_intake"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(datadog_secret_function);
 }
 
@@ -96,6 +99,9 @@ bool TryGetDatadogCredentials(ClientContext &context, const string &secret_name,
 	}
 	if (kv_secret->TryGetValue("trace_agent_url", value) && !value.IsNull()) {
 		creds.trace_agent_url = value.ToString();
+	}
+	if (kv_secret->TryGetValue("trace_intake", value) && !value.IsNull()) {
+		creds.trace_intake = value.ToString();
 	}
 	credentials = std::move(creds);
 	return true;

@@ -616,13 +616,12 @@ bool ParseDatadogHexId(const string &text, uint64_t &low, string &high_hex) {
 	return true;
 }
 
-//! Distribute one attribute JSON object across a span's meta (strings) and metrics (numbers)
-//! objects. Booleans become "true"/"false" meta strings; objects and arrays are serialized to
-//! compact JSON meta strings; nulls are dropped. Keys already present in either object are never
-//! overwritten, and malformed input is silently ignored so a bad attribute column cannot fail the
-//! whole send.
-static void MergeAttributesIntoAgentSpan(yyjson_mut_doc *doc, yyjson_mut_val *meta, yyjson_mut_val *metrics,
-                                         const string &attributes_json) {
+//! Distribute one attribute JSON object across a span's resolved meta (strings) and metrics
+//! (numbers) lists. Keys in `seen` are never overwritten; malformed input is silently ignored so
+//! a bad attribute column cannot fail the whole send.
+static void MergeAttributesIntoResolved(const string &attributes_json, std::unordered_set<string> &seen,
+                                        vector<std::pair<string, string>> &meta,
+                                        vector<std::pair<string, double>> &metrics) {
 	if (attributes_json.empty()) {
 		return;
 	}
@@ -639,31 +638,48 @@ static void MergeAttributesIntoAgentSpan(yyjson_mut_doc *doc, yyjson_mut_val *me
 	yyjson_val *key;
 	while ((key = yyjson_obj_iter_next(&iter))) {
 		const char *key_str = yyjson_get_str(key);
-		if (!key_str || yyjson_mut_obj_get(meta, key_str) || yyjson_mut_obj_get(metrics, key_str)) {
+		if (!key_str || seen.count(key_str)) {
 			continue;
 		}
 		yyjson_val *val = yyjson_obj_iter_get_val(key);
-		// The key must be copied into the mutable doc: the *_add_strcpy helpers copy only the
-		// value, and `key_str` dies with the parsed source doc before the body is serialized.
-		yyjson_mut_val *mut_key = yyjson_mut_strcpy(doc, key_str);
-		if (!mut_key) {
-			continue;
-		}
 		if (yyjson_is_str(val)) {
-			yyjson_mut_obj_add(meta, mut_key, yyjson_mut_strcpy(doc, yyjson_get_str(val)));
+			meta.emplace_back(key_str, yyjson_get_str(val));
 		} else if (yyjson_is_num(val)) {
-			yyjson_mut_obj_add(metrics, mut_key, yyjson_mut_real(doc, yyjson_get_num(val)));
+			metrics.emplace_back(key_str, yyjson_get_num(val));
 		} else if (yyjson_is_bool(val)) {
-			yyjson_mut_obj_add(meta, mut_key, yyjson_mut_str(doc, yyjson_get_bool(val) ? "true" : "false"));
+			meta.emplace_back(key_str, yyjson_get_bool(val) ? "true" : "false");
 		} else if (yyjson_is_obj(val) || yyjson_is_arr(val)) {
 			size_t length = 0;
 			YyjsonStrPtr serialized(yyjson_val_write(val, 0, &length));
 			if (serialized) {
-				yyjson_mut_obj_add(meta, mut_key, yyjson_mut_strncpy(doc, serialized.get(), length));
+				meta.emplace_back(key_str, string(serialized.get(), length));
+			} else {
+				continue;
 			}
+		} else {
+			// null values are dropped: the agent's meta/metrics carry only strings and numbers.
+			continue;
 		}
-		// null values are dropped: the agent's meta/metrics carry only strings and numbers.
+		seen.insert(key_str);
 	}
+}
+
+void ResolveDatadogAgentSpanAttributes(const DatadogAgentSpan &span, vector<std::pair<string, string>> &meta,
+                                       vector<std::pair<string, double>> &metrics) {
+	meta.clear();
+	metrics.clear();
+	std::unordered_set<string> seen;
+	if (!span.trace_id_high_hex.empty()) {
+		meta.emplace_back("_dd.p.tid", span.trace_id_high_hex);
+		seen.insert("_dd.p.tid");
+	}
+	for (const auto &pair : span.meta) {
+		if (!pair.second.empty() && seen.insert(pair.first).second) {
+			meta.emplace_back(pair.first, pair.second);
+		}
+	}
+	MergeAttributesIntoResolved(span.span_attributes_json, seen, meta, metrics);
+	MergeAttributesIntoResolved(span.resource_attributes_json, seen, meta, metrics);
 }
 
 string BuildDatadogAgentTracesBody(const DatadogAgentSpan *spans, idx_t count, idx_t &trace_count) {
@@ -713,23 +729,23 @@ string BuildDatadogAgentTracesBody(const DatadogAgentSpan *spans, idx_t count, i
 			yyjson_mut_obj_add_int(doc.get(), obj, "error", 1);
 		}
 
-		auto meta = yyjson_mut_obj(doc.get());
-		auto metrics = yyjson_mut_obj(doc.get());
-		// Reserved entries first so attribute JSON can never clobber them.
-		if (!span.trace_id_high_hex.empty()) {
-			yyjson_mut_obj_add_strcpy(doc.get(), meta, "_dd.p.tid", span.trace_id_high_hex.c_str());
-		}
-		for (const auto &pair : span.meta) {
-			if (!pair.second.empty() && !yyjson_mut_obj_get(meta, pair.first.c_str())) {
-				yyjson_mut_obj_add_strcpy(doc.get(), meta, pair.first.c_str(), pair.second.c_str());
+		vector<std::pair<string, string>> resolved_meta;
+		vector<std::pair<string, double>> resolved_metrics;
+		ResolveDatadogAgentSpanAttributes(span, resolved_meta, resolved_metrics);
+		if (!resolved_meta.empty()) {
+			auto meta = yyjson_mut_obj(doc.get());
+			for (const auto &pair : resolved_meta) {
+				yyjson_mut_obj_add(meta, yyjson_mut_strcpy(doc.get(), pair.first.c_str()),
+				                   yyjson_mut_strcpy(doc.get(), pair.second.c_str()));
 			}
-		}
-		MergeAttributesIntoAgentSpan(doc.get(), meta, metrics, span.span_attributes_json);
-		MergeAttributesIntoAgentSpan(doc.get(), meta, metrics, span.resource_attributes_json);
-		if (yyjson_mut_obj_size(meta) > 0) {
 			yyjson_mut_obj_add_val(doc.get(), obj, "meta", meta);
 		}
-		if (yyjson_mut_obj_size(metrics) > 0) {
+		if (!resolved_metrics.empty()) {
+			auto metrics = yyjson_mut_obj(doc.get());
+			for (const auto &pair : resolved_metrics) {
+				yyjson_mut_obj_add(metrics, yyjson_mut_strcpy(doc.get(), pair.first.c_str()),
+				                   yyjson_mut_real(doc.get(), pair.second));
+			}
 			yyjson_mut_obj_add_val(doc.get(), obj, "metrics", metrics);
 		}
 

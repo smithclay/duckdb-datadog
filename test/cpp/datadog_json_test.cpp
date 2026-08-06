@@ -1,4 +1,5 @@
 #include "datadog_json.hpp"
+#include "datadog_trace_proto.hpp"
 
 #include <iostream>
 #include <stdexcept>
@@ -365,6 +366,65 @@ int main() {
 		idx_t empty_trace_count = 123;
 		Require(BuildDatadogAgentTracesBody(nullptr, 0, empty_trace_count) == "[]" && empty_trace_count == 0,
 		        "an empty span batch should produce an empty trace array");
+
+		// --- Direct-intake protobuf AgentPayload (write_datadog_traces, TRACE_INTAKE 'direct') ----
+		auto bytes = [](std::initializer_list<int> values) {
+			string result;
+			for (int value : values) {
+				result.push_back(static_cast<char>(value));
+			}
+			return result;
+		};
+
+		// A minimal span encodes to an exactly predictable payload (field numbers from
+		// pkg/proto/datadog/trace in DataDog/datadog-agent).
+		DatadogAgentSpan tiny;
+		tiny.trace_id = 1;
+		tiny.span_id = 2;
+		tiny.service = "s";
+		tiny.name = "n";
+		tiny.resource = "r";
+		tiny.start_ns = 5;
+		tiny.duration_ns = 6;
+		idx_t proto_trace_count = 0;
+		auto payload = EncodeDatadogAgentPayload({tiny}, "", "", proto_trace_count);
+		auto span_bytes = bytes({0x0A, 1}) + "s" + bytes({0x12, 1}) + "n" + bytes({0x1A, 1}) + "r" +
+		                  bytes({0x20, 1, 0x28, 2, 0x38, 5, 0x40, 6});
+		auto chunk_bytes = bytes({0x08, 1, 0x1A, static_cast<int>(span_bytes.size())}) + span_bytes;
+		auto tracer_bytes =
+		    bytes({0x12, 6}) + "duckdb" + bytes({0x32, static_cast<int>(chunk_bytes.size())}) + chunk_bytes;
+		auto expected_payload =
+		    bytes({0x2A, static_cast<int>(tracer_bytes.size())}) + tracer_bytes + bytes({0x3A, 14}) + "duckdb-datadog";
+		Require(proto_trace_count == 1, "a single-trace protobuf payload should count one trace");
+		Require(payload == expected_payload,
+		        "the protobuf AgentPayload encoding should match the datadog-agent wire format exactly");
+
+		// Structural checks on a rich batch: grouping, parent/error fields, meta and metrics entries.
+		idx_t rich_trace_count = 0;
+		auto rich = EncodeDatadogAgentPayload({root_span, child_span, other_trace}, "host-1", "e2e", rich_trace_count);
+		Require(rich_trace_count == 2, "protobuf chunks should group like the JSON body (128-bit ids distinct)");
+		Require(rich.find(bytes({0x30, 1})) != string::npos, "a parent id should encode as span field 6");
+		Require(rich.find(bytes({0x48, 1})) != string::npos, "an errored span should encode error=1 as field 9");
+		Require(rich.find("_dd.p.tid") != string::npos && rich.find("463ac35c9f6413ad") != string::npos,
+		        "the 128-bit tid tag should ride in the protobuf meta map");
+		Require(rich.find("connection refused") != string::npos, "reserved meta entries should be encoded");
+		// metrics entry value: field 2, wire type 1 (64-bit LE double); 200.0 = 0x4069000000000000.
+		Require(rich.find(bytes({0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x69, 0x40})) != string::npos,
+		        "numeric span attributes should encode as double metrics map entries");
+		Require(rich.find("host-1") != string::npos && rich.find("e2e") != string::npos,
+		        "hostname and env should stamp the payload when provided");
+		Require(rich.find("should-not-win") == string::npos,
+		        "the protobuf path shares the JSON path's no-overwrite attribute resolution");
+
+		// The shared resolver: reserved entries first, first writer wins across meta and metrics.
+		vector<std::pair<string, string>> resolved_meta;
+		vector<std::pair<string, double>> resolved_metrics;
+		ResolveDatadogAgentSpanAttributes(root_span, resolved_meta, resolved_metrics);
+		Require(!resolved_meta.empty() && resolved_meta[0].first == "span.kind",
+		        "reserved meta entries should resolve ahead of attribute JSON");
+		Require(resolved_metrics.size() == 1 && resolved_metrics[0].first == "http.status_code" &&
+		            resolved_metrics[0].second == 200,
+		        "numeric attributes should resolve into metrics");
 
 		// Aggregation request bodies carry the filter, exactly one compute, and per-facet group-bys.
 		auto agg_body = BuildDatadogLogsAggregateBody("service:web @duration_ns:>=100", "now-1h", "now", "cardinality",

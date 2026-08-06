@@ -515,16 +515,32 @@ Column notes for the Datadog mapping:
 
 ### Writing spans
 
-`write_datadog_traces` sends OTLP-shaped span rows to a **Datadog Agent** — Datadog's backend has
-no public JSON trace intake, so traces go through the Agent's
-[local trace API](https://docs.datadoghq.com/api/latest/tracing/) (`http://localhost:8126` by
-default). Like `send_datadog_logs` it takes a `STRUCT` per row and returns `'ok'` per sent span:
+`write_datadog_traces` sends OTLP-shaped span rows to Datadog. Like `send_datadog_logs` it takes
+a `STRUCT` per row and returns `'ok'` per sent span, and it has two destinations:
+
+- **`agent` (default)** — JSON to a Datadog Agent's
+  [local trace API](https://docs.datadoghq.com/api/latest/tracing/) (`http://localhost:8126` by
+  default, override with the `TRACE_AGENT_URL` secret field). A local Agent needs no credentials,
+  so this works with zero secrets configured.
+- **`direct`** — set `TRACE_INTAKE 'direct'` on the secret to skip the Agent entirely: spans are
+  encoded as the protobuf `AgentPayload` and sent straight to Datadog's backend trace intake at
+  `https://trace.agent.<site>/api/v0.2/traces`, authenticated by `API_KEY` alone. This is the
+  same wire protocol the OpenTelemetry collector's Datadog exporter uses for agentless ingestion;
+  it is stable in practice but not a documented public API, and Agent-side niceties (APM stats,
+  obfuscation, local sampling) do not apply.
 
 ```sql
 -- No secret needed for a local Agent:
 SELECT write_datadog_traces(t) FROM my_spans t;
 
--- Round-trip spans from one account/window into another Agent:
+-- Agentless: straight to the Datadog backend.
+CREATE SECRET dd_direct (
+    TYPE datadog, API_KEY '<dd-api-key>', APP_KEY '<dd-app-key>',
+    SITE 'datadoghq.com', TRACE_INTAKE 'direct'
+);
+SELECT write_datadog_traces(t, 'dd_direct') FROM my_spans t;
+
+-- Round-trip spans from one account/window into another:
 SELECT write_datadog_traces(t)
 FROM read_datadog_traces(query => 'service:checkout', "from" => 'now-15m') t;
 ```

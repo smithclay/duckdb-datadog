@@ -40,6 +40,7 @@ set(EXTENSION_SOURCES src/datadog_extension.cpp src/datadog_secret.cpp
                       src/traces_table.cpp
                       src/datadog_catalog.cpp
                       src/send_logs.cpp src/write_traces.cpp
+                      src/datadog_trace_proto.cpp
                       src/datadog_server.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
@@ -64,7 +65,8 @@ endforeach()
 # extension's public SQL surface.
 add_executable(datadog_json_test EXCLUDE_FROM_ALL
                                  test/cpp/datadog_json_test.cpp
-                                 src/datadog_json.cpp)
+                                 src/datadog_json.cpp
+                                 src/datadog_trace_proto.cpp)
 target_include_directories(
   datadog_json_test PRIVATE src/include
                              "${DATADOG_DUCKDB_DIR}/third_party/yyjson/include")

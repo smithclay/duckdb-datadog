@@ -3,6 +3,7 @@
 #include "datadog_client.hpp"
 #include "datadog_json.hpp"
 #include "datadog_secret.hpp"
+#include "datadog_trace_proto.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -52,17 +53,22 @@ struct WriteTracesFieldIndices {
 struct DatadogWriteTracesBindData : public FunctionData {
 	WriteTracesFieldIndices fields;
 	DatadogClient client;
+	//! true = protobuf straight to the backend trace intake (TRACE_INTAKE 'direct');
+	//! false = JSON to a Datadog Agent (the default).
+	bool direct_intake = false;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<DatadogWriteTracesBindData>();
 		result->fields = fields;
+		result->direct_intake = direct_intake;
 		client.CopyConfigTo(result->client);
 		return std::move(result);
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<DatadogWriteTracesBindData>();
-		return fields == other.fields && client.site == other.client.site && client.api_key == other.client.api_key &&
-		       client.app_key == other.client.app_key && client.trace_agent_url == other.client.trace_agent_url;
+		return fields == other.fields && direct_intake == other.direct_intake && client.site == other.client.site &&
+		       client.api_key == other.client.api_key && client.app_key == other.client.app_key &&
+		       client.trace_agent_url == other.client.trace_agent_url;
 	}
 };
 
@@ -128,15 +134,31 @@ static unique_ptr<FunctionData> DatadogWriteTracesBind(ClientContext &context, S
 		}
 	}
 
-	// Traces go to a (local by default) Datadog Agent, which needs no credentials, so a completely
+	// By default traces go to a (local) Datadog Agent, which needs no credentials, so a completely
 	// unconfigured session still works: an in-scope datadog secret merely contributes its
-	// trace_agent_url/api_key configuration when present.
+	// trace_agent_url/api_key configuration when present. TRACE_INTAKE 'direct' switches to the
+	// backend trace intake, which authenticates with the API key alone.
 	DatadogCredentials credentials;
 	if (TryGetDatadogCredentials(context, secret_name, credentials)) {
 		result->client.site = credentials.site;
 		result->client.api_key = credentials.api_key;
 		result->client.app_key = credentials.app_key;
 		result->client.trace_agent_url = credentials.trace_agent_url;
+		auto mode = StringUtil::Lower(credentials.trace_intake);
+		if (mode == "direct") {
+			if (credentials.api_key.empty()) {
+				throw BinderException("write_datadog_traces: TRACE_INTAKE 'direct' sends straight to the Datadog "
+				                      "backend and requires API_KEY in the secret");
+			}
+			result->direct_intake = true;
+		} else if (!mode.empty() && mode != "agent") {
+			throw BinderException("write_datadog_traces: TRACE_INTAKE must be 'agent' or 'direct' (got '%s')",
+			                      credentials.trace_intake);
+		}
+		if (result->direct_intake && !credentials.trace_agent_url.empty()) {
+			throw BinderException(
+			    "write_datadog_traces: TRACE_AGENT_URL and TRACE_INTAKE 'direct' are mutually exclusive");
+		}
 	}
 
 	bound_function.return_type = LogicalType::VARCHAR;
@@ -359,11 +381,17 @@ static void DatadogWriteTracesFunction(DataChunk &args, ExpressionState &state, 
 		return;
 	}
 
-	// One request per chunk: spans grouped into traces (the agent's payload shape). A chunk holds
-	// at most STANDARD_VECTOR_SIZE spans, which stays far below the agent's payload limits.
+	// One request per chunk: spans grouped into traces. A chunk holds at most STANDARD_VECTOR_SIZE
+	// spans, which stays far below either endpoint's payload limits. Both bodies are built from the
+	// same resolved spans, so agent and direct mode send identical data.
 	idx_t trace_count = 0;
-	string body = BuildDatadogAgentTracesBody(spans, trace_count);
-	bind.client.SendTraces(context, body, trace_count); // throws on non-2xx / exhausted retries
+	if (bind.direct_intake) {
+		string payload = EncodeDatadogAgentPayload(spans, /*hostname=*/"", /*env=*/"", trace_count);
+		bind.client.SendTracesDirect(context, payload, trace_count); // throws on non-2xx / exhausted retries
+	} else {
+		string body = BuildDatadogAgentTracesBody(spans, trace_count);
+		bind.client.SendTraces(context, body, trace_count); // throws on non-2xx / exhausted retries
+	}
 	for (auto row : source_rows) {
 		result.SetValue(row, Value("ok"));
 	}

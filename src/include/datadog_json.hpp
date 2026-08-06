@@ -154,6 +154,16 @@ struct DatadogAgentSpan {
 	string resource_attributes_json; //! JSON object; merged after span attributes, never overwrites
 };
 
+//! Resolve a span's final meta (string) and metrics (numeric) entries, in order: `_dd.p.tid` for a
+//! 128-bit trace id, the caller's reserved meta entries, then span_attributes_json, then
+//! resource_attributes_json. The first writer of a key wins across both lists, so reserved entries
+//! can never be overwritten by attribute JSON. Booleans become "true"/"false" meta strings, JSON
+//! objects/arrays are serialized to compact JSON meta strings, and nulls are dropped. Both the
+//! JSON trace-agent body and the protobuf direct-intake payload are built from this one resolver,
+//! so the two write paths cannot drift apart.
+void ResolveDatadogAgentSpanAttributes(const DatadogAgentSpan &span, vector<std::pair<string, string>> &meta,
+                                       vector<std::pair<string, double>> &metrics);
+
 //! Build the trace agent body from `count` spans starting at `spans`: a JSON array of traces
 //! (spans grouped by trace id in first-seen order), each an array of span objects. `trace_count`
 //! receives the number of traces for the X-Datadog-Trace-Count request header.

@@ -721,3 +721,55 @@ physical_plan	<REGEX>:.*"Datadog Query": "[*]".*"Datadog From": "now-15m".*"Data
 
 statement ok
 DROP SECRET dd_traces;
+
+# TRACE_INTAKE 'direct' sends protobuf straight to the backend trace intake (no Agent). It needs
+# an API key; a secret without one fails at bind, before anything is sent.
+statement ok
+CREATE SECRET dd_direct_nokey (TYPE datadog, TRACE_INTAKE 'direct');
+
+statement error
+DESCRIBE SELECT write_datadog_traces({'trace_id': 'ab', 'span_id': 'cd'}, 'dd_direct_nokey');
+----
+requires API_KEY
+
+statement ok
+DROP SECRET dd_direct_nokey;
+
+# An unknown mode is rejected at bind.
+statement ok
+CREATE SECRET dd_direct_bad (TYPE datadog, API_KEY 'k', APP_KEY 'a', TRACE_INTAKE 'proxy');
+
+statement error
+DESCRIBE SELECT write_datadog_traces({'trace_id': 'ab', 'span_id': 'cd'}, 'dd_direct_bad');
+----
+must be 'agent' or 'direct'
+
+statement ok
+DROP SECRET dd_direct_bad;
+
+# The two trace destinations are mutually exclusive.
+statement ok
+CREATE SECRET dd_direct_conflict (
+    TYPE datadog, API_KEY 'k', APP_KEY 'a',
+    TRACE_INTAKE 'direct', TRACE_AGENT_URL 'http://127.0.0.1:8126'
+);
+
+statement error
+DESCRIBE SELECT write_datadog_traces({'trace_id': 'ab', 'span_id': 'cd'}, 'dd_direct_conflict');
+----
+mutually exclusive
+
+statement ok
+DROP SECRET dd_direct_conflict;
+
+# A well-formed direct-intake secret binds offline (bind only; nothing is sent).
+statement ok
+CREATE SECRET dd_direct (TYPE datadog, API_KEY 'k', APP_KEY 'a', TRACE_INTAKE 'direct');
+
+query I
+SELECT column_type FROM (DESCRIBE SELECT write_datadog_traces({'trace_id': 'ab12', 'span_id': 'cd34'}, 'dd_direct'));
+----
+VARCHAR
+
+statement ok
+DROP SECRET dd_direct;

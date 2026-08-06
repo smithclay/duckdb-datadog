@@ -107,6 +107,14 @@ struct DatadogClient {
 	//! fresh connection: the Agent is local, so per-request connection setup is negligible.
 	string SendTraces(ClientContext &context, const string &traces_body_json, idx_t trace_count) const;
 
+	//! POST a protobuf AgentPayload directly to Datadog's trace intake at
+	//! https://trace.agent.<site>/api/v0.2/traces — no Agent involved. This is the wire protocol
+	//! the OpenTelemetry collector's Datadog exporter uses for agentless ingestion; it is stable in
+	//! practice but not a documented public API. Requires an API key (DD-API-KEY); the application
+	//! key is not used. Native builds gzip the body. Same non-idempotent retry policy as SendLogs:
+	//! only pre-send transport failures, 429, and 5xx are retried.
+	string SendTracesDirect(ClientContext &context, const string &agent_payload_protobuf, idx_t trace_count) const;
+
 private:
 #ifndef __EMSCRIPTEN__
 	//! Lazily created on first use and reused (HTTP keep-alive) for every later request. Mutable

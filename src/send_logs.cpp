@@ -68,7 +68,7 @@ struct DatadogSendLogsBindData : public FunctionData {
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<DatadogSendLogsBindData>();
 		return fields == other.fields && client.site == other.client.site && client.api_key == other.client.api_key &&
-		       client.app_key == other.client.app_key;
+		       client.app_key == other.client.app_key && client.intake_url == other.client.intake_url;
 	}
 };
 
@@ -157,6 +157,7 @@ static unique_ptr<FunctionData> DatadogSendLogsBind(ClientContext &context, Scal
 	result->client.site = credentials.site;
 	result->client.api_key = credentials.api_key;
 	result->client.app_key = credentials.app_key;
+	result->client.intake_url = credentials.intake_url;
 
 	bound_function.return_type = LogicalType::VARCHAR;
 	return std::move(result);

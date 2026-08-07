@@ -1,17 +1,17 @@
 # duckdb-datadog
 
 A DuckDB extension that reads logs, open monitor alerts, and APM service dependencies from Datadog
-directly into DuckDB, receives logs through a native intake server, and sends OTLP-shaped log
-tables back to Datadog.
+directly into DuckDB, runs server-side log aggregations (counts, cardinalities, percentiles),
+receives logs through a native intake server, and sends OTLP-shaped log tables back to Datadog.
 Log rows conform to the [duckdb-otlp](https://github.com/smithclay/otlp2records)
 `read_otlp_logs` schema, so Datadog logs drop straight into an OTLP-shaped lakehouse alongside
 data from other sources.
 
-Reading, receiving, and sending logs, reading open monitor alerts, and querying service maps are
-supported today;
-traces/spans and metrics are planned.
-See [Receiving logs](#receiving-logs) for the native `datadog_serve` intake server and
-[Sending logs](#sending-logs) for the `send_datadog_logs` scalar function.
+Reading, receiving, and sending logs, reading and writing traces/spans, reading open monitor
+alerts, and querying service maps are supported today.
+See [Receiving logs](#receiving-logs) for the native `datadog_serve` intake server,
+[Sending logs](#sending-logs) for the `send_datadog_logs` scalar function, and
+[Traces](#traces) for `read_datadog_traces` / `write_datadog_traces`.
 
 ## Quick start
 
@@ -69,6 +69,12 @@ SELECT * FROM dd.alerts.open ORDER BY last_triggered_at DESC;
 
 -- One row per directed caller -> callee edge from the latest hour.
 SELECT * FROM dd.service_map.dependencies;
+
+-- Indexed spans (last 15 minutes) in the duckdb-otlp trace schema.
+SELECT * FROM dd.traces.spans WHERE service_name = 'checkout';
+
+-- Timeseries points for the attachment's METRICS_QUERY.
+SELECT * FROM dd.metrics.series;
 ```
 
 Without `INDEXES`, `ATTACH` calls Datadog's log-index configuration endpoint once and caches the
@@ -155,6 +161,37 @@ FROM read_datadog_service_dependencies(
 `-15m` and `now-1h` (units: `s`, `m`, `h`, `d`, or `w`). Optional `secret`, `retries`, and `timeout`
 parameters follow `read_datadog_logs`. The API response supplies topology but not per-edge types or
 statistics, so those canonical columns are `NULL` for Datadog.
+
+### Traces and metrics tables
+
+`dd.traces.spans` exposes indexed spans through the same scanner as
+[`read_datadog_traces`](#reading-spans): the 24-column duckdb-otlp schema over the reader's
+defaults (query `*`, `now-15m` to `now`, and the attachment's `SORT`/`PAGE_SIZE`/`MAX_ROWS`/
+`RETRIES`/`TIMEOUT`). Supported `WHERE` predicates are translated conservatively — a
+`service_name = '...'` equality becomes a `service:` search term and `start_time_unix_nano`
+bounds tighten an absolute window — with the original predicates always retained as DuckDB
+residual filters. Use `read_datadog_traces` for a custom span query or relative window.
+
+`dd.metrics.series` runs the attachment's metrics query through the same scanner as
+`read_datadog_metrics`:
+
+```sql
+ATTACH 'datadog:' AS dd (
+    TYPE datadog,
+    SECRET 'dd_prod',
+    INDEXES ['main'],
+    METRICS_QUERY 'avg:system.cpu.user{*} by {host}',
+    METRICS_START_TIME '-1h',   -- default now-15m
+    METRICS_END_TIME 'now'
+);
+
+SELECT time_unix_nano, name, double_value, service_name
+FROM dd.metrics.series;
+```
+
+Like the service map, the metrics table is lazy: it binds and `DESCRIBE`s without configuration
+and raises a focused `METRICS_QUERY` error only when scanned, and relative windows are resolved
+when each scan starts, so a long-lived attachment keeps returning the latest window.
 
 Both interfaces return the same schema, making provider maps easy to combine with
 `UNION ALL BY NAME`: `provider`, `source_service`, `target_service`, `source_type`, `target_type`, `edge_type`,
@@ -260,6 +297,58 @@ JSON — Datadog custom attributes); `dropped_attributes_count`, `flags` (INTEGE
 
 Because attribute columns are JSON strings, query them with DuckDB's JSON functions, e.g.
 `SELECT log_attributes->>'$.http.status_code' FROM logs`.
+
+## Aggregations
+
+`read_datadog_log_stats` asks the [Logs Aggregation API](https://docs.datadoghq.com/api/latest/logs/#aggregate-events)
+one question and returns its buckets, so a count over millions of logs costs one request instead
+of a paginated row scan. Reach for it for count-style questions; use `read_datadog_logs` when you
+need the rows themselves.
+
+```sql
+-- Error logs per service over the last hour.
+SELECT by->>'$.service' AS service, value::BIGINT AS errors
+FROM read_datadog_log_stats(
+    query    => 'status:error',
+    "from"   => 'now-1h',
+    "to"     => 'now',
+    compute  => 'count',
+    group_by => ['service'],
+    group_limit => 100
+);
+
+-- Distinct trace ids matching a filter (one cardinality request, no row transfer).
+SELECT value::BIGINT AS traces
+FROM read_datadog_log_stats(
+    query   => 'service:payment @duration_ns:>=4500000000',
+    "from"  => 'now-1h',
+    "to"    => 'now',
+    compute => 'cardinality',
+    metric  => '@trace_id'
+);
+```
+
+Each row is one bucket: `by` (VARCHAR) holds the group-by key values as a JSON object (`{}` for an
+ungrouped total) and `value` (DOUBLE) holds the computed number. `compute` accepts Datadog's
+aggregations (`count`, `cardinality`, `avg`, `sum`, `min`, `max`, `pc75`/`pc90`/`pc95`/`pc98`/`pc99`);
+everything except `count` needs `metric`, the `@attribute` facet to aggregate over. A null compute
+(e.g. a percentile over zero matching logs) is a SQL `NULL`. `value` is exact for counts up to
+2^53, far past any log volume the API will return.
+
+| Parameter     | Type      | Default    | Description |
+|---------------|-----------|------------|-------------|
+| `query`       | VARCHAR   | `*`        | Datadog log search query. |
+| `from`        | VARCHAR   | `now-15m`  | Start of the time window. |
+| `to`          | VARCHAR   | `now`      | End of the time window. |
+| `compute`     | VARCHAR   | `count`    | Datadog aggregation to compute. |
+| `metric`      | VARCHAR   | —          | Facet to aggregate (required unless `compute` is `count`). |
+| `group_by`    | VARCHAR[] | none       | Facets to group by. |
+| `group_limit` | BIGINT    | `10`       | Max buckets per facet (1–10000, the Datadog cap). |
+| `retries`, `timeout`, `secret` | | | Same behavior as `read_datadog_logs`. |
+
+Grouping and non-count aggregations follow Datadog's facet rules: an attribute generally needs a
+facet declared on it before it can appear in `metric` or `group_by`. Requires the
+`logs_read_data` permission.
 
 ## Receiving logs
 
@@ -394,8 +483,127 @@ Notes:
 - Datadog drops logs whose `timestamp` is more than ~18h in the past; when replaying old data,
   either omit the timestamp column or expect those logs not to be indexed.
 - A `NULL` log struct maps to a `NULL` result and is not sent.
-- Concurrency-safe: the function may run on multiple threads, and sends to the shared connection are
-  serialized internally.
+- Request bodies are gzip-compressed, and each projection thread sends on its own pooled
+  keep-alive connection, so large sends upload batches in parallel rather than serializing on
+  one socket. Note that parallel batches make the partial-failure window above wider, not
+  narrower — order of delivery across batches is not guaranteed.
+
+### Sending somewhere other than Datadog
+
+The optional `INTAKE_URL` secret field points `send_datadog_logs` at any v2-intake-compatible
+listener instead of `https://http-intake.logs.<site>`: a local `datadog_serve`, an intake proxy,
+or a mock in CI. It accepts a bare origin or a full intake URL (a trailing `/api/v2/logs` is
+stripped), so the value `datadog_serve()` returns can be pasted verbatim:
+
+```sql
+SELECT datadog_serve('datadog:127.0.0.1:10518', {table_name: 'received'});
+-- http://127.0.0.1:10518/api/v2/logs
+
+CREATE SECRET dd_local (
+    TYPE datadog,
+    API_KEY 'local-key',
+    APP_KEY 'unused-for-intake',
+    INTAKE_URL 'http://127.0.0.1:10518/api/v2/logs'
+);
+
+SELECT send_datadog_logs(l, 'dd_local') FROM my_logs l;
+SELECT count(*) FROM received;  -- the logs, round-tripped without leaving the process
+```
+
+This makes the whole send path testable offline; `test/sql/datadog_send_local.test` is exactly
+this loop. Reads (`read_datadog_logs` and friends) are unaffected by `INTAKE_URL`.
+
+## Traces
+
+### Reading spans
+
+`read_datadog_traces` reads indexed spans through the
+[Spans API](https://docs.datadoghq.com/api/latest/spans/#search-spans) into the
+[duckdb-otlp `read_otlp_traces`](https://smithclay.github.io/duckdb-otlp/reference/schemas/#traces-read_otlp_traces)
+24-column schema, so Datadog spans line up with trace data from any other OTLP source:
+
+```sql
+-- Slow checkout spans in the last hour.
+SELECT trace_id, name, service_name, duration_time_unix_nano / 1e6 AS ms
+FROM read_datadog_traces(
+    query  => 'service:checkout @duration:>1s',
+    "from" => 'now-1h',
+    "to"   => 'now'
+)
+ORDER BY duration_time_unix_nano DESC;
+```
+
+Parameters (`query`, `from`, `to`, `sort`, `page_size`, `max_rows`, `retries`, `timeout`,
+`secret`) behave exactly like `read_datadog_logs`, including cursor pagination, retry/rate-limit
+handling, and projection pushdown. `query` takes Datadog's span search syntax. Requires
+`APP_KEY` with the `apm_read` permission.
+
+Column notes for the Datadog mapping:
+- `start_time_unix_nano` / `duration_time_unix_nano` come from the span's start/end timestamps
+  (falling back to the custom `duration` measure, which Datadog records in nanoseconds).
+- `trace_id`, `span_id`, `parent_span_id` are passed through as the API's string form.
+- `name` is the Datadog operation name when present, else `resource_name`.
+- `kind` and error status (`status_code` = 2, `status_status_message`) are derived from the
+  `span.kind` and `error.*` tags when the span carries them.
+- `span_attributes` is the span's custom attributes plus Datadog's reserved per-span fields
+  (`resource_name`, `type`, `single_span`, `ingestion_reason`, `retained_by`);
+  `resource_attributes` carries `host`, `env`, and `ddtags`. Columns Datadog has no equivalent
+  for (`trace_state`, `scope_*`, `events_json`, `links_json`, `dropped_*`, `flags`) are `NULL`.
+
+### Writing spans
+
+`write_datadog_traces` sends OTLP-shaped span rows to Datadog. Like `send_datadog_logs` it takes
+a `STRUCT` per row and returns `'ok'` per sent span, and it has two destinations:
+
+- **`agent` (default)** — JSON to a Datadog Agent's
+  [local trace API](https://docs.datadoghq.com/api/latest/tracing/) (`http://localhost:8126` by
+  default, override with the `TRACE_AGENT_URL` secret field). A local Agent needs no credentials,
+  so this works with zero secrets configured.
+- **`direct`** — set `TRACE_INTAKE 'direct'` on the secret to skip the Agent entirely: spans are
+  encoded as the protobuf `AgentPayload` and sent straight to Datadog's backend trace intake at
+  `https://trace.agent.<site>/api/v0.2/traces`, authenticated by `API_KEY` alone. This is the
+  same wire protocol the OpenTelemetry collector's Datadog exporter uses for agentless ingestion;
+  it is stable in practice but not a documented public API, and Agent-side niceties (APM stats,
+  obfuscation, local sampling) do not apply.
+
+```sql
+-- No secret needed for a local Agent:
+SELECT write_datadog_traces(t) FROM my_spans t;
+
+-- Agentless: straight to the Datadog backend.
+CREATE SECRET dd_direct (
+    TYPE datadog, API_KEY '<dd-api-key>', APP_KEY '<dd-app-key>',
+    SITE 'datadoghq.com', TRACE_INTAKE 'direct'
+);
+SELECT write_datadog_traces(t, 'dd_direct') FROM my_spans t;
+
+-- Round-trip spans from one account/window into another:
+SELECT write_datadog_traces(t)
+FROM read_datadog_traces(query => 'service:checkout', "from" => 'now-15m') t;
+```
+
+Recognized columns (first match wins): `trace_id` and `span_id` (required; OTLP hex strings or
+unsigned integers), `parent_span_id`/`parent_id`, `name`/`operation_name`,
+`resource`/`resource_name` (defaults to the name), `service_name`/`service`,
+`start_time_unix_nano` (TIMESTAMP or integer epoch nanoseconds; required),
+`duration_time_unix_nano`/`duration_ns`/`duration`, `kind` (OTLP integer → `span.kind` tag;
+servers default to type `web`), `type`/`span_type`, `status_code` (2 → `error: 1`),
+`status_status_message`/`status_message` (→ `error.message`), `trace_state`, `events_json`,
+`links_json`, and JSON `span_attributes`/`resource_attributes` (strings → `meta`, numbers →
+`metrics`).
+
+Notes:
+- A 128-bit hex `trace_id` is split Datadog-style: lower 64 bits become the wire trace id and the
+  upper 64 bits ride in the `_dd.p.tid` tag, so 128-bit OTLP traces keep their identity.
+- Rows that cannot form a valid span (missing/invalid `trace_id`, `span_id`, or start time)
+  return `'skipped: <reason>'` instead of failing the whole send; a `NULL` struct returns `NULL`.
+- Spans are grouped into traces per chunk and sent as one JSON `PUT /v0.3/traces` request, with
+  the same conservative non-idempotent retry rules as `send_datadog_logs`.
+- The optional `TRACE_AGENT_URL` secret field points the writer at a remote Agent or a mock in
+  CI (a trailing `/v0.3/traces` is stripped). `DD-API-KEY` is attached only when the secret has
+  an `API_KEY`, so a plain local Agent needs no secret at all.
+- The Agent applies its own normalization and sampling; spans older than the Agent's acceptance
+  window may be dropped.
 
 ## Building
 

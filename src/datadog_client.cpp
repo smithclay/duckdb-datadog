@@ -9,6 +9,8 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 
+#include <cstring>
+
 #ifndef __EMSCRIPTEN__
 #include <chrono>
 #include <thread>
@@ -41,9 +43,49 @@ static string NormalizeSite(const string &raw) {
 }
 
 //! Base URL for the log intake API. This is a distinct host from the search/config API
-//! (`api.<site>`); logs are always accepted at `https://http-intake.logs.<site>`.
-static string BuildIntakeBaseUrl(const string &site) {
+//! (`api.<site>`); by default logs are accepted at `https://http-intake.logs.<site>`. A non-empty
+//! `intake_url` overrides the host entirely (e.g. a local `datadog_serve` listener or an intake
+//! proxy). The override accepts a bare origin or a full intake URL: a trailing `/api/v2/logs` is
+//! stripped so the value `datadog_serve()` returns can be pasted verbatim.
+static string BuildIntakeBaseUrl(const string &site, const string &intake_url) {
+	if (!intake_url.empty()) {
+		string url = intake_url;
+		StringUtil::Trim(url);
+		while (!url.empty() && url.back() == '/') {
+			url.pop_back();
+		}
+		constexpr const char *INTAKE_PATH_SUFFIX = "/api/v2/logs";
+		if (StringUtil::EndsWith(url, INTAKE_PATH_SUFFIX)) {
+			url.resize(url.size() - strlen(INTAKE_PATH_SUFFIX));
+		}
+		return url;
+	}
 	return "https://http-intake.logs." + NormalizeSite(site);
+}
+
+//! Base URL for the Datadog Agent's trace API. Unlike logs, Datadog's backend trace intake has no
+//! public JSON API, so traces always go through an Agent (local by default). The override accepts
+//! a bare origin or a full URL: a trailing `/v0.3/traces` is stripped so a copied endpoint works
+//! verbatim.
+static string BuildTraceAgentBaseUrl(const string &trace_agent_url) {
+	string url = trace_agent_url;
+	StringUtil::Trim(url);
+	if (url.empty()) {
+		return "http://localhost:8126";
+	}
+	while (!url.empty() && url.back() == '/') {
+		url.pop_back();
+	}
+	constexpr const char *TRACES_PATH_SUFFIX = "/v0.3/traces";
+	if (StringUtil::EndsWith(url, TRACES_PATH_SUFFIX)) {
+		url.resize(url.size() - strlen(TRACES_PATH_SUFFIX));
+	}
+	return url;
+}
+
+//! Base URL for Datadog's backend trace intake used by agentless direct sends.
+static string BuildTraceIntakeBaseUrl(const string &site) {
+	return "https://trace.agent." + NormalizeSite(site);
 }
 
 static string BuildBaseUrl(const string &site) {
@@ -90,6 +132,8 @@ void DatadogClient::CopyConfigTo(DatadogClient &target) const {
 	target.site = site;
 	target.api_key = api_key;
 	target.app_key = app_key;
+	target.intake_url = intake_url;
+	target.trace_agent_url = trace_agent_url;
 	target.timeout_seconds = timeout_seconds;
 	target.retries = retries;
 }
@@ -109,14 +153,35 @@ duckdb_httplib_openssl::Client &DatadogClient::GetConnection() const {
 	return *connection;
 }
 
-duckdb_httplib_openssl::Client &DatadogClient::GetIntakeConnection() const {
-	if (!intake_connection) {
-		intake_connection = make_uniq<duckdb_httplib_openssl::Client>(BuildIntakeBaseUrl(site));
-		intake_connection->set_connection_timeout(static_cast<time_t>(timeout_seconds), 0);
-		intake_connection->set_read_timeout(static_cast<time_t>(timeout_seconds), 0);
-		intake_connection->set_keep_alive(true);
+unique_ptr<duckdb_httplib_openssl::Client> DatadogClient::NewIntakeConnection() const {
+	auto intake_connection = make_uniq<duckdb_httplib_openssl::Client>(BuildIntakeBaseUrl(site, intake_url));
+	intake_connection->set_connection_timeout(static_cast<time_t>(timeout_seconds), 0);
+	intake_connection->set_read_timeout(static_cast<time_t>(timeout_seconds), 0);
+	intake_connection->set_keep_alive(true);
+	// Datadog's intake accepts Content-Encoding: gzip; batches compress well (JSON with repeated
+	// keys), so this cuts upload bytes several-fold on large sends.
+	intake_connection->set_compress(true);
+	return intake_connection;
+}
+
+unique_ptr<duckdb_httplib_openssl::Client> DatadogClient::AcquireIntakeConnection() const {
+	{
+		std::lock_guard<std::mutex> pool_guard(intake_pool_mutex);
+		if (!intake_pool.empty()) {
+			auto intake_connection = std::move(intake_pool.back());
+			intake_pool.pop_back();
+			return intake_connection;
+		}
 	}
-	return *intake_connection;
+	return NewIntakeConnection();
+}
+
+void DatadogClient::ReleaseIntakeConnection(unique_ptr<duckdb_httplib_openssl::Client> intake_connection) const {
+	if (!intake_connection) {
+		return;
+	}
+	std::lock_guard<std::mutex> pool_guard(intake_pool_mutex);
+	intake_pool.push_back(std::move(intake_connection));
 }
 
 //! Sleep for `seconds`, polling the query's interrupt flag so a cancelled query (Ctrl+C) aborts
@@ -300,11 +365,31 @@ string DatadogClient::SearchLogs(ClientContext &context, const string &request_b
 	return AuthenticatedRequest(context, "/api/v2/logs/events/search", &request_body_json, false);
 }
 
+string DatadogClient::SearchSpans(ClientContext &context, const string &request_body_json) const {
+	return AuthenticatedRequest(context, "/api/v2/spans/events/search", &request_body_json, false);
+}
+
+string DatadogClient::AggregateLogs(ClientContext &context, const string &request_body_json) const {
+	return AuthenticatedRequest(context, "/api/v2/logs/analytics/aggregate", &request_body_json, false);
+}
+
 string DatadogClient::QueryMetrics(ClientContext &context, const string &query, int64_t from, int64_t to) const {
 	static constexpr char HEX[] = "0123456789ABCDEF";
 	string encoded;
-	for (auto ch : query) { auto c = static_cast<unsigned char>(ch); if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') encoded += char(c); else { encoded += '%'; encoded += HEX[c >> 4]; encoded += HEX[c & 15]; } }
-	return AuthenticatedRequest(context, "/api/v1/query?from=" + std::to_string(from) + "&to=" + std::to_string(to) + "&query=" + encoded, nullptr, false);
+	for (auto ch : query) {
+		auto c = static_cast<unsigned char>(ch);
+		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+		    c == '.' || c == '~')
+			encoded += char(c);
+		else {
+			encoded += '%';
+			encoded += HEX[c >> 4];
+			encoded += HEX[c & 15];
+		}
+	}
+	return AuthenticatedRequest(
+	    context, "/api/v1/query?from=" + std::to_string(from) + "&to=" + std::to_string(to) + "&query=" + encoded,
+	    nullptr, false);
 }
 
 string DatadogClient::SearchOpenAlerts(ClientContext &context, int64_t page, int64_t per_page) const {
@@ -330,7 +415,7 @@ string DatadogClient::SendLogs(ClientContext &context, const string &intake_body
 		throw InterruptException();
 	}
 
-	const auto base_url = BuildIntakeBaseUrl(site);
+	const auto base_url = BuildIntakeBaseUrl(site, intake_url);
 	const auto url = base_url + INTAKE_PATH;
 	auto &http_util = HTTPUtil::Get(*context.db);
 	auto params = http_util.InitializeParameters(context, url);
@@ -379,22 +464,25 @@ string DatadogClient::SendLogs(ClientContext &context, const string &intake_body
 	    {"Accept", "application/json"},
 	};
 
-	// One client is shared across all send_datadog_logs projection threads; serialize so concurrent
-	// invocations never use the single intake socket at the same time.
-	std::lock_guard<std::mutex> intake_guard(intake_mutex);
+	// Each send checks its own connection out of the pool, so concurrent send_datadog_logs
+	// projection threads upload batches in parallel. Only a send that completes returns its
+	// connection; any exception path lets the local unique_ptr close the socket instead, so a
+	// broken or interrupted connection can never re-enter the pool.
+	auto intake_connection = AcquireIntakeConnection();
 
 	for (uint64_t attempt = 0;; attempt++) {
 		if (context.interrupted) {
 			throw InterruptException();
 		}
-		auto response = GetIntakeConnection().Post(INTAKE_PATH, headers, intake_body_json, "application/json");
+		auto response = intake_connection->Post(INTAKE_PATH, headers, intake_body_json, "application/json");
 
 		if (!response) {
 			auto error = response.error();
-			intake_connection.reset();
+			// The socket may be half-dead after a transport error; retry on a fresh connection.
+			intake_connection = NewIntakeConnection();
 			// Only pre-send failures are safe to retry on this non-idempotent write endpoint.
 			if (attempt >= retries || !IsPreSendTransportError(error)) {
-				throw IOException("Datadog log intake request to %s failed: %s", BuildIntakeBaseUrl(site),
+				throw IOException("Datadog log intake request to %s failed: %s", BuildIntakeBaseUrl(site, intake_url),
 				                  duckdb_httplib_openssl::to_string(error));
 			}
 			SleepCheckingInterrupt(context, MinValue<uint64_t>(uint64_t(1) << attempt, 60));
@@ -411,6 +499,220 @@ string DatadogClient::SendLogs(ClientContext &context, const string &intake_body
 		}
 		if (response->status < 200 || response->status >= 300) {
 			throw IOException("Datadog log intake returned HTTP %d: %s", response->status, response->body);
+		}
+		auto body = response->body;
+		ReleaseIntakeConnection(std::move(intake_connection));
+		return body;
+	}
+#endif
+}
+
+string DatadogClient::SendTraces(ClientContext &context, const string &traces_body_json, idx_t trace_count) const {
+	constexpr const char *TRACES_PATH = "/v0.3/traces";
+	const auto base_url = BuildTraceAgentBaseUrl(trace_agent_url);
+	const auto trace_count_text = std::to_string(trace_count);
+#ifdef __EMSCRIPTEN__
+	if (context.interrupted) {
+		throw InterruptException();
+	}
+
+	const auto url = base_url + TRACES_PATH;
+	auto &http_util = HTTPUtil::Get(*context.db);
+	auto params = http_util.InitializeParameters(context, url);
+	params->timeout = timeout_seconds;
+	// The trace endpoint is not idempotent; do not let the browser transport blindly retry a write
+	// whose response may have been lost.
+	params->retries = 0;
+	params->keep_alive = true;
+	params->follow_location = false;
+
+	HTTPHeaders headers;
+	if (!api_key.empty()) {
+		headers.Insert("DD-API-KEY", api_key);
+	}
+	headers.Insert("X-Datadog-Trace-Count", trace_count_text);
+	headers.Insert("Accept", "application/json");
+
+	const string content_type = "application/json";
+	PutRequestInfo request(url, headers, *params, reinterpret_cast<const_data_ptr_t>(traces_body_json.data()),
+	                       traces_body_json.size(), content_type);
+	request.try_request = true;
+	auto response = http_util.Request(request);
+
+	if (!response) {
+		throw IOException("Datadog trace agent request failed through %s: no response (check the agent URL and CORS "
+		                  "allowlist)",
+		                  base_url);
+	}
+	if (!response->Success()) {
+		auto status = static_cast<uint16_t>(response->status);
+		if (response->status != HTTPStatusCode::INVALID) {
+			auto detail = BrowserHTTPErrorDetail(*response);
+			if (detail.empty()) {
+				detail = "request rejected without a response body";
+			}
+			throw IOException("Datadog trace agent returned HTTP %d through %s: %s", status, base_url, detail);
+		}
+		throw IOException("Datadog trace agent request failed through %s: %s (check the agent URL, CORS allowlist, "
+		                  "and network connection)",
+		                  base_url, response->GetError());
+	}
+	return response->body;
+#else
+	// The local Agent requires no authentication; the API key is attached only when configured so a
+	// trace_agent_url override pointing at a keyed proxy still authenticates.
+	duckdb_httplib_openssl::Headers headers = {
+	    {"X-Datadog-Trace-Count", trace_count_text},
+	    {"Accept", "application/json"},
+	};
+	if (!api_key.empty()) {
+		headers.emplace("DD-API-KEY", api_key);
+	}
+
+	// A fresh connection per call keeps concurrent projection threads trivially safe; the agent is
+	// (almost always) on localhost, where connection setup cost is negligible.
+	auto agent_connection = make_uniq<duckdb_httplib_openssl::Client>(base_url);
+	agent_connection->set_connection_timeout(static_cast<time_t>(timeout_seconds), 0);
+	agent_connection->set_read_timeout(static_cast<time_t>(timeout_seconds), 0);
+	agent_connection->set_keep_alive(true);
+
+	for (uint64_t attempt = 0;; attempt++) {
+		if (context.interrupted) {
+			throw InterruptException();
+		}
+		auto response = agent_connection->Put(TRACES_PATH, headers, traces_body_json, "application/json");
+
+		if (!response) {
+			auto error = response.error();
+			// The socket may be half-dead after a transport error; retry on a fresh connection.
+			agent_connection = make_uniq<duckdb_httplib_openssl::Client>(base_url);
+			agent_connection->set_connection_timeout(static_cast<time_t>(timeout_seconds), 0);
+			agent_connection->set_read_timeout(static_cast<time_t>(timeout_seconds), 0);
+			agent_connection->set_keep_alive(true);
+			// Only pre-send failures are safe to retry on this non-idempotent write endpoint.
+			if (attempt >= retries || !IsPreSendTransportError(error)) {
+				throw IOException("Datadog trace agent request to %s failed: %s (is a Datadog Agent with APM enabled "
+				                  "listening there?)",
+				                  base_url, duckdb_httplib_openssl::to_string(error));
+			}
+			SleepCheckingInterrupt(context, MinValue<uint64_t>(uint64_t(1) << attempt, 60));
+			continue;
+		}
+
+		if (response->status == 429 && attempt < retries) {
+			SleepCheckingInterrupt(context, RateLimitRetryDelaySeconds(*response, attempt));
+			continue;
+		}
+		if (response->status >= 500 && attempt < retries) {
+			SleepCheckingInterrupt(context, MinValue<uint64_t>(uint64_t(1) << attempt, 60));
+			continue;
+		}
+		if (response->status < 200 || response->status >= 300) {
+			throw IOException("Datadog trace agent returned HTTP %d: %s", response->status, response->body);
+		}
+		return response->body;
+	}
+#endif
+}
+
+string DatadogClient::SendTracesDirect(ClientContext &context, const string &agent_payload_protobuf,
+                                       idx_t trace_count) const {
+	constexpr const char *TRACES_PATH = "/api/v0.2/traces";
+	constexpr const char *CONTENT_TYPE = "application/x-protobuf";
+	const auto base_url = BuildTraceIntakeBaseUrl(site);
+	const auto trace_count_text = std::to_string(trace_count);
+#ifdef __EMSCRIPTEN__
+	if (context.interrupted) {
+		throw InterruptException();
+	}
+
+	const auto url = base_url + TRACES_PATH;
+	auto &http_util = HTTPUtil::Get(*context.db);
+	auto params = http_util.InitializeParameters(context, url);
+	params->timeout = timeout_seconds;
+	// The trace intake is not idempotent; do not let the browser transport blindly retry a write
+	// whose response may have been lost.
+	params->retries = 0;
+	params->keep_alive = true;
+	params->follow_location = false;
+
+	HTTPHeaders headers;
+	headers.Insert("DD-API-KEY", api_key);
+	headers.Insert("Content-Type", CONTENT_TYPE);
+	headers.Insert("X-Datadog-Reported-Languages", "duckdb");
+	headers.Insert("X-Datadog-Trace-Count", trace_count_text);
+
+	PostRequestInfo request(url, headers, *params, reinterpret_cast<const_data_ptr_t>(agent_payload_protobuf.data()),
+	                        agent_payload_protobuf.size());
+	request.try_request = true;
+	auto response = http_util.Request(request);
+
+	if (!response) {
+		throw IOException("Datadog trace intake request failed through %s: no response (check the proxy URL and CORS "
+		                  "allowlist)",
+		                  base_url);
+	}
+	if (!response->Success()) {
+		auto status = static_cast<uint16_t>(response->status);
+		if (response->status != HTTPStatusCode::INVALID) {
+			auto detail = BrowserHTTPErrorDetail(*response);
+			if (detail.empty()) {
+				detail = "request rejected without a response body";
+			}
+			throw IOException("Datadog trace intake returned HTTP %d through %s: %s", status, base_url, detail);
+		}
+		throw IOException("Datadog trace intake request failed through %s: %s", base_url, response->GetError());
+	}
+	return response->body;
+#else
+	duckdb_httplib_openssl::Headers headers = {
+	    {"DD-API-KEY", api_key},
+	    {"X-Datadog-Reported-Languages", "duckdb"},
+	    {"X-Datadog-Trace-Count", trace_count_text},
+	    {"Accept", "application/json"},
+	};
+
+	// A fresh gzip-compressing connection per call, mirroring SendTraces: sends are chunk-sized and
+	// concurrent projection threads stay trivially safe.
+	auto make_connection = [&]() {
+		auto intake = make_uniq<duckdb_httplib_openssl::Client>(base_url);
+		intake->set_connection_timeout(static_cast<time_t>(timeout_seconds), 0);
+		intake->set_read_timeout(static_cast<time_t>(timeout_seconds), 0);
+		intake->set_keep_alive(true);
+		intake->set_compress(true);
+		return intake;
+	};
+	auto intake_connection = make_connection();
+
+	for (uint64_t attempt = 0;; attempt++) {
+		if (context.interrupted) {
+			throw InterruptException();
+		}
+		auto response = intake_connection->Post(TRACES_PATH, headers, agent_payload_protobuf, CONTENT_TYPE);
+
+		if (!response) {
+			auto error = response.error();
+			// The socket may be half-dead after a transport error; retry on a fresh connection.
+			intake_connection = make_connection();
+			// Only pre-send failures are safe to retry on this non-idempotent write endpoint.
+			if (attempt >= retries || !IsPreSendTransportError(error)) {
+				throw IOException("Datadog trace intake request to %s failed: %s", base_url,
+				                  duckdb_httplib_openssl::to_string(error));
+			}
+			SleepCheckingInterrupt(context, MinValue<uint64_t>(uint64_t(1) << attempt, 60));
+			continue;
+		}
+
+		if (response->status == 429 && attempt < retries) {
+			SleepCheckingInterrupt(context, RateLimitRetryDelaySeconds(*response, attempt));
+			continue;
+		}
+		if (response->status >= 500 && attempt < retries) {
+			SleepCheckingInterrupt(context, MinValue<uint64_t>(uint64_t(1) << attempt, 60));
+			continue;
+		}
+		if (response->status < 200 || response->status >= 300) {
+			throw IOException("Datadog trace intake returned HTTP %d: %s", response->status, response->body);
 		}
 		return response->body;
 	}

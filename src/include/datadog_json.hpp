@@ -2,6 +2,8 @@
 
 #include "duckdb.hpp"
 
+#include <utility>
+
 namespace duckdb {
 
 //! Conservative predicates translated from DuckDB WHERE clauses. Query terms are
@@ -97,6 +99,78 @@ DatadogResolvedSearch ResolveDatadogSearch(const string &query, const string &fr
 //! omitted when `indexes` is empty so read_datadog_logs retains its existing request shape.
 string BuildDatadogLogsSearchBody(const string &query, const string &from, const string &to, const string &sort,
                                   int64_t limit, const string &cursor, const vector<string> &indexes = {});
+
+//! One bucket returned by the Logs Aggregation API: the group-by key values as a JSON object
+//! (`{}` for an ungrouped total) and the single requested compute value. `has_value` is false
+//! when Datadog returns a null compute (e.g. a percentile over zero matching logs).
+struct DatadogLogStatsBucket {
+	string by_json = "{}";
+	bool has_value = false;
+	double value = 0;
+};
+
+//! Build the POST body for /api/v2/logs/analytics/aggregate: one compute (aggregation +
+//! optional metric) and zero or more group-by facets, each capped at `group_limit` buckets.
+//! The metric field is omitted when `metric` is empty (a plain count needs none).
+string BuildDatadogLogsAggregateBody(const string &query, const string &from, const string &to,
+                                     const string &aggregation, const string &metric, const vector<string> &group_by,
+                                     int64_t group_limit);
+
+//! Parse one aggregation response into buckets. A missing or empty bucket list is a valid
+//! zero-match result, not an error. Throws IOException on malformed JSON.
+vector<DatadogLogStatsBucket> ParseDatadogLogsAggregateResponse(const string &response_json);
+
+//! Build the POST body for /api/v2/spans/events/search. The spans search API wraps its request
+//! in a {"data": {"type": "search_request", "attributes": {...}}} envelope, unlike the flat body
+//! the logs search API accepts; filter/page/sort semantics are otherwise identical.
+string BuildDatadogSpansSearchBody(const string &query, const string &from, const string &to, const string &sort,
+                                   int64_t limit, const string &cursor);
+
+//! Parse an OTLP hex identifier (1-32 hex characters, e.g. a trace_id or span_id column) into the
+//! Datadog trace agent's unsigned 64-bit representation. A 128-bit id is split: `low` receives the
+//! lower 64 bits and `high_hex` the upper 64 bits as zero-stripped lowercase hex (the value Datadog
+//! carries in the `_dd.p.tid` tag). Returns false for empty, non-hex, or over-long input.
+bool ParseDatadogHexId(const string &text, uint64_t &low, string &high_hex);
+
+//! One span for the Datadog trace agent JSON API (PUT <agent>/v0.3/traces). Ids are the agent's
+//! unsigned 64-bit form; empty string fields are omitted from the payload.
+struct DatadogAgentSpan {
+	uint64_t trace_id = 0; //! lower 64 bits of the trace id
+	uint64_t span_id = 0;
+	bool has_parent_id = false;
+	uint64_t parent_id = 0;
+	string trace_id_high_hex; //! non-empty for a 128-bit trace id -> meta `_dd.p.tid`
+	string service;
+	string name;             //! Datadog operation name
+	string resource;         //! Datadog resource; callers usually default it to `name`
+	string type;             //! Datadog span type (web/db/cache/custom); "" omits the field
+	int64_t start_ns = 0;    //! span start, nanoseconds since epoch
+	int64_t duration_ns = 0; //! span duration in nanoseconds
+	bool error = false;      //! true -> error: 1
+	//! Reserved meta entries (span.kind, error.message, ...) set by the caller. These are written
+	//! first, so attribute JSON below can never overwrite them.
+	vector<std::pair<string, string>> meta;
+	string span_attributes_json;     //! JSON object; strings -> meta, numbers -> metrics
+	string resource_attributes_json; //! JSON object; merged after span attributes, never overwrites
+};
+
+//! Resolve a span's final meta (string) and metrics (numeric) entries, in order: `_dd.p.tid` for a
+//! 128-bit trace id, the caller's reserved meta entries, then span_attributes_json, then
+//! resource_attributes_json. The first writer of a key wins across both lists, so reserved entries
+//! can never be overwritten by attribute JSON. Booleans become "true"/"false" meta strings, JSON
+//! objects/arrays are serialized to compact JSON meta strings, and nulls are dropped. Both the
+//! JSON trace-agent body and the protobuf direct-intake payload are built from this one resolver,
+//! so the two write paths cannot drift apart.
+void ResolveDatadogAgentSpanAttributes(const DatadogAgentSpan &span, vector<std::pair<string, string>> &meta,
+                                       vector<std::pair<string, double>> &metrics);
+
+//! Build the trace agent body from `count` spans starting at `spans`: a JSON array of traces
+//! (spans grouped by trace id in first-seen order), each an array of span objects. `trace_count`
+//! receives the number of traces for the X-Datadog-Trace-Count request header.
+string BuildDatadogAgentTracesBody(const DatadogAgentSpan *spans, idx_t count, idx_t &trace_count);
+inline string BuildDatadogAgentTracesBody(const vector<DatadogAgentSpan> &spans, idx_t &trace_count) {
+	return BuildDatadogAgentTracesBody(spans.data(), spans.size(), trace_count);
+}
 
 //! One OTLP-shaped log to send through the Datadog log intake API. Every string field is optional;
 //! an empty string means "absent" and the corresponding Datadog attribute is omitted. `host` and

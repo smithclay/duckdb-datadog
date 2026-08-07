@@ -4,6 +4,7 @@
 
 #ifndef __EMSCRIPTEN__
 #include <mutex>
+#include <vector>
 
 //! Forward-declared so the native-only httplib header stays out of this public header. The
 //! namespace name matches cpp-httplib's OpenSSL build selected by CMake.
@@ -25,6 +26,15 @@ struct DatadogClient {
 	string site = "datadoghq.com";
 	string api_key;
 	string app_key;
+	//! Optional intake base URL override (default: https://http-intake.logs.<site>). Accepts a
+	//! bare origin or a full intake URL (a trailing /api/v2/logs is stripped), so the value
+	//! `datadog_serve()` returns can be pasted verbatim.
+	string intake_url;
+	//! Base URL of the Datadog Agent's trace API used by write_datadog_traces (default:
+	//! http://localhost:8126). Accepts a bare origin or a full URL (a trailing /v0.3/traces is
+	//! stripped). Traces are sent to a local Agent rather than directly to Datadog because the
+	//! backend trace intake has no public JSON API.
+	string trace_agent_url;
 	//! Per-request connection/read timeout.
 	uint64_t timeout_seconds = 60;
 	//! Retry budget for transient failures: HTTP 429 (waits the server-advised delay from
@@ -55,6 +65,14 @@ struct DatadogClient {
 	//! InterruptException if the query was cancelled. Successive calls reuse the same HTTP
 	//! connection.
 	string SearchLogs(ClientContext &context, const string &request_body_json) const;
+	//! POST `request_body_json` to /api/v2/spans/events/search and return the raw response body.
+	//! Authentication, connection pooling, retries, backoff, cancellation, and TLS behavior are
+	//! shared with SearchLogs; the spans search API paginates through the same cursor scheme.
+	string SearchSpans(ClientContext &context, const string &request_body_json) const;
+	//! POST `request_body_json` to /api/v2/logs/analytics/aggregate and return the raw response
+	//! body. Authentication, retries, backoff, cancellation, and TLS behavior are shared with
+	//! SearchLogs; one aggregation request replaces a paginated scan for count-style questions.
+	string AggregateLogs(ClientContext &context, const string &request_body_json) const;
 	//! GET one v1 metrics query window; the query text is percent-encoded by the client.
 	string QueryMetrics(ClientContext &context, const string &query, int64_t from, int64_t to) const;
 
@@ -73,10 +91,29 @@ struct DatadogClient {
 	string ListLogIndexes(ClientContext &context) const;
 
 	//! POST `intake_body_json` (a JSON array of logs) to the log intake API at
-	//! https://http-intake.logs.<site>/api/v2/logs and return the raw response body. Unlike the
-	//! search/config endpoints this host uses only DD-API-KEY (no application key). Shares the same
-	//! retry, backoff, cancellation, and TLS behavior; a successful send returns HTTP 202.
+	//! https://http-intake.logs.<site>/api/v2/logs (or the intake_url override) and return the raw
+	//! response body. Unlike the search/config endpoints this host uses only DD-API-KEY (no
+	//! application key). Shares the same retry, backoff, cancellation, and TLS behavior; a
+	//! successful send returns HTTP 202. Native builds gzip the request body and may run several
+	//! sends concurrently, each on its own pooled connection.
 	string SendLogs(ClientContext &context, const string &intake_body_json) const;
+
+	//! PUT `traces_body_json` (a JSON array of traces, each an array of spans) to the Datadog
+	//! Agent's trace API at http://localhost:8126/v0.3/traces (or the trace_agent_url override).
+	//! The local Agent needs no authentication; DD-API-KEY is attached only when an api_key is
+	//! configured so an override pointing at a keyed proxy still works. `trace_count` fills the
+	//! X-Datadog-Trace-Count header the Agent uses for sampling bookkeeping. Like SendLogs, only
+	//! pre-send transport failures are retried — the endpoint is not idempotent. Each call uses a
+	//! fresh connection: the Agent is local, so per-request connection setup is negligible.
+	string SendTraces(ClientContext &context, const string &traces_body_json, idx_t trace_count) const;
+
+	//! POST a protobuf AgentPayload directly to Datadog's trace intake at
+	//! https://trace.agent.<site>/api/v0.2/traces — no Agent involved. This is the wire protocol
+	//! the OpenTelemetry collector's Datadog exporter uses for agentless ingestion; it is stable in
+	//! practice but not a documented public API. Requires an API key (DD-API-KEY); the application
+	//! key is not used. Native builds gzip the body. Same non-idempotent retry policy as SendLogs:
+	//! only pre-send transport failures, 429, and 5xx are retried.
+	string SendTracesDirect(ClientContext &context, const string &agent_payload_protobuf, idx_t trace_count) const;
 
 private:
 #ifndef __EMSCRIPTEN__
@@ -86,20 +123,23 @@ private:
 	//! error, since the failure may have left the pooled socket in a broken state.
 	mutable unique_ptr<duckdb_httplib_openssl::Client> connection;
 
-	//! Separate keep-alive connection to the log intake host (http-intake.logs.<site>), which is a
-	//! different origin from the api.<site> host the search/config endpoints use. Lazily created and
-	//! reset on transport error, mirroring `connection`.
-	mutable unique_ptr<duckdb_httplib_openssl::Client> intake_connection;
-
-	//! Serializes SendLogs across threads. Unlike the reader (which forces MaxThreads()==1), the
-	//! send_datadog_logs scalar can run on several projection threads that all share this one client;
-	//! the mutex prevents concurrent use of the single non-thread-safe intake socket.
-	mutable std::mutex intake_mutex;
+	//! Pool of idle keep-alive connections to the log intake host (http-intake.logs.<site> or the
+	//! intake_url override), which is a different origin from the api.<site> host the search/config
+	//! endpoints use. The send_datadog_logs scalar can run on several projection threads; each send
+	//! checks a connection out of the pool (creating one when the pool is empty), so batches upload
+	//! in parallel instead of serializing on one socket. The mutex guards only the pool itself.
+	//! Connections that hit a transport error are dropped rather than returned.
+	mutable std::mutex intake_pool_mutex;
+	mutable std::vector<unique_ptr<duckdb_httplib_openssl::Client>> intake_pool;
 
 	//! Return the shared connection, creating and configuring it on the first call.
 	duckdb_httplib_openssl::Client &GetConnection() const;
-	//! Return the shared intake connection, creating and configuring it on the first call.
-	duckdb_httplib_openssl::Client &GetIntakeConnection() const;
+	//! Create a fresh, configured connection to the intake host.
+	unique_ptr<duckdb_httplib_openssl::Client> NewIntakeConnection() const;
+	//! Check an intake connection out of the pool, creating one when the pool is empty.
+	unique_ptr<duckdb_httplib_openssl::Client> AcquireIntakeConnection() const;
+	//! Return a healthy intake connection to the pool for reuse.
+	void ReleaseIntakeConnection(unique_ptr<duckdb_httplib_openssl::Client> intake_connection) const;
 #endif
 
 	//! Perform an authenticated GET or POST. A null body selects GET; otherwise POST JSON.

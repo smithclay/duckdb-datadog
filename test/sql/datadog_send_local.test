@@ -58,6 +58,47 @@ SELECT count(*) FROM roundtrip_logs;
 ----
 3
 
+# --- send_datadog_metrics ------------------------------------------------------
+#
+# The intake_url override redirects metrics too, so one local listener receives both signals.
+
+query T
+SELECT send_datadog_metrics(m, 'dd_local')
+FROM (
+    SELECT * FROM (VALUES
+        (TIMESTAMP_NS '2026-08-05 13:01:00', 'http.server.request.count', '{request}', 120.0, 'payment', '{"run_id":"abc"}'),
+        (TIMESTAMP_NS '2026-08-05 13:02:00', 'http.server.request.count', '{request}', 140.0, 'payment', '{"run_id":"abc"}')
+    ) t(time_unix_nano, name, unit, double_value, service_name, metric_attributes)
+) m;
+----
+ok
+ok
+
+# Points land one row each, typed as gauges (3), with service_name and every metric_attributes
+# entry flattened into Datadog's only per-point dimension mechanism: tags.
+query IIIIT
+SELECT metric, timestamp_seconds, value, type, tags
+FROM datadog_metric_series ORDER BY value;
+----
+http.server.request.count	1785934860	120.0	3	['service:payment', 'run_id:abc']
+http.server.request.count	1785934920	140.0	3	['service:payment', 'run_id:abc']
+
+# A NULL reading is not a zero: a gauge with nothing to report sends no point.
+query T
+SELECT send_datadog_metrics({'name': 'cpu', 'double_value': NULL::DOUBLE}, 'dd_local');
+----
+NULL
+
+query I
+SELECT count(*) FROM datadog_metric_series;
+----
+2
+
+statement error
+DESCRIBE SELECT send_datadog_metrics({'name': 'cpu'}, 'dd_local');
+----
+needs a 'double_value' or 'value' column
+
 query T
 SELECT datadog_stop('datadog:127.0.0.1:55521');
 ----

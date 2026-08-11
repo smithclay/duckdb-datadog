@@ -164,6 +164,7 @@ private:
 struct DatadogServerConfig {
 	string schema_name = "main";
 	string table_name = "datadog_logs";
+	string metrics_table_name = "datadog_metric_series";
 	string api_key;
 	bool allow_other_hostname = false;
 	bool create_table = true;
@@ -441,6 +442,62 @@ static vector<vector<Value>> ParseIntakeBody(const string &content_type, const s
 	return rows;
 }
 
+//! Parse an /api/v2/series payload into one row per point. Datadog nests points under a series, so
+//! a series carrying N points becomes N rows -- the shape a caller wants to aggregate in SQL.
+static vector<vector<Value>> ParseSeriesBody(const string &content_type, const string &body) {
+	(void)content_type; // The series intake is JSON only; there is no ndjson variant to branch on.
+	vector<vector<Value>> rows;
+	YyjsonDocPtr doc(yyjson_read(body.c_str(), body.size(), 0));
+	auto root = doc ? yyjson_doc_get_root(doc.get()) : nullptr;
+	if (!root || !yyjson_is_obj(root)) {
+		throw InvalidInputException("Datadog series payload must be a JSON object");
+	}
+	auto series = yyjson_obj_get(root, "series");
+	if (!series || !yyjson_is_arr(series)) {
+		throw InvalidInputException("Datadog series payload must carry a 'series' array");
+	}
+	size_t series_index, series_count;
+	yyjson_val *entry;
+	yyjson_arr_foreach(series, series_index, series_count, entry) {
+		auto metric = yyjson_obj_get(entry, "metric");
+		if (!metric || !yyjson_is_str(metric)) {
+			throw InvalidInputException("each Datadog series requires a 'metric' name");
+		}
+		auto unit = yyjson_obj_get(entry, "unit");
+		auto type = yyjson_obj_get(entry, "type");
+		vector<Value> tag_values;
+		auto tags = yyjson_obj_get(entry, "tags");
+		if (tags && yyjson_is_arr(tags)) {
+			size_t tag_index, tag_count;
+			yyjson_val *tag;
+			yyjson_arr_foreach(tags, tag_index, tag_count, tag) {
+				if (yyjson_is_str(tag)) {
+					tag_values.push_back(Value(string(yyjson_get_str(tag))));
+				}
+			}
+		}
+		auto points = yyjson_obj_get(entry, "points");
+		if (!points || !yyjson_is_arr(points)) {
+			throw InvalidInputException("each Datadog series requires a 'points' array");
+		}
+		size_t point_index, point_count;
+		yyjson_val *point;
+		yyjson_arr_foreach(points, point_index, point_count, point) {
+			auto timestamp = yyjson_obj_get(point, "timestamp");
+			auto value = yyjson_obj_get(point, "value");
+			if (!timestamp || !yyjson_is_num(timestamp) || !value || !yyjson_is_num(value)) {
+				throw InvalidInputException("each Datadog point requires a numeric timestamp and value");
+			}
+			rows.push_back({Value(string(yyjson_get_str(metric))), Value::BIGINT(yyjson_get_sint(timestamp)),
+			                Value::DOUBLE(yyjson_get_real(value)),
+			                type && yyjson_is_int(type) ? Value::BIGINT(yyjson_get_sint(type)) : Value(),
+			                unit && yyjson_is_str(unit) ? Value(string(yyjson_get_str(unit))) : Value(),
+			                Value::LIST(LogicalType::VARCHAR, tag_values)});
+		}
+	}
+	return rows;
+}
+
 static idx_t DefaultHttpThreads() {
 	auto cores = std::thread::hardware_concurrency();
 	if (cores == 0) {
@@ -541,6 +598,32 @@ public:
 		server->Post("/api/v1/logs", handler);
 		server->Post("/v1/input", handler);
 
+		// Metrics are a different intake with a different payload shape, so they get their own
+		// route and their own table rather than being coerced into the log schema.
+		server->Post("/api/v2/series", [this](const duckdb_httplib_openssl::Request &request,
+		                                      duckdb_httplib_openssl::Response &response) {
+			try {
+				if (request.body.size() > config.max_body_bytes) {
+					SetJson(response, 413, "{\"errors\":[\"Payload Too Large\"]}");
+					return;
+				}
+				auto supplied_key = request.get_header_value("DD-API-KEY");
+				if (!config.api_key.empty() && !TimingSafeEqual(supplied_key, config.api_key)) {
+					SetJson(response, 403, "{\"errors\":[\"Forbidden\"]}");
+					return;
+				}
+				auto rows = ParseSeriesBody(request.get_header_value("Content-Type"), request.body);
+				AppendSeries(rows);
+				total_requests++;
+				total_rows += rows.size();
+				SetJson(response, 202, "{\"errors\":[]}");
+			} catch (InvalidInputException &ex) {
+				SetJson(response, 400, "{\"errors\":[\"" + JsonEscape(ex.what()) + "\"]}");
+			} catch (std::exception &ex) {
+				SetJson(response, 500, "{\"errors\":[\"" + JsonEscape(ex.what()) + "\"]}");
+			}
+		});
+
 		if (!server->is_valid() || !server->bind_to_port(uri.Host(), uri.Port())) {
 			throw IOException("Failed to bind Datadog HTTP server to %s", uri.BaseUrl());
 		}
@@ -610,6 +693,50 @@ private:
 		if (!valid) {
 			throw InvalidInputException("Datadog target table %s must have the 18-column read_datadog_logs schema",
 			                            qualified);
+		}
+		EnsureMetricsTable();
+	}
+
+	void EnsureMetricsTable() {
+		if (!config.create_table) {
+			return;
+		}
+		// One row per point, not per series: a caller aggregating in SQL wants points. `tags` stays
+		// a LIST so filtering works in core DuckDB without the json extension loaded.
+		auto result = writer->Query("CREATE TABLE IF NOT EXISTS " + QualifiedMetrics() +
+		                            " (metric VARCHAR, timestamp_seconds BIGINT, value DOUBLE, "
+		                            "type BIGINT, unit VARCHAR, tags VARCHAR[])");
+		if (!result || result->HasError()) {
+			throw IOException("Could not create Datadog metric table %s: %s", QualifiedMetrics(),
+			                  result ? result->GetError() : "query failed");
+		}
+	}
+
+	string QualifiedMetrics() const {
+		return KeywordHelper::WriteOptionallyQuoted(config.schema_name) + "." +
+		       KeywordHelper::WriteOptionallyQuoted(config.metrics_table_name);
+	}
+
+	void AppendSeries(const vector<vector<Value>> &rows) {
+		if (rows.empty()) {
+			return;
+		}
+		std::lock_guard<std::mutex> lock(writer_mutex);
+		writer->BeginTransaction();
+		try {
+			Appender appender(*writer, config.schema_name, config.metrics_table_name);
+			for (auto &row : rows) {
+				appender.BeginRow();
+				for (auto &value : row) {
+					appender.Append(value);
+				}
+				appender.EndRow();
+			}
+			appender.Close();
+			writer->Commit();
+		} catch (...) {
+			writer->Rollback();
+			throw;
 		}
 	}
 
@@ -772,6 +899,7 @@ static DatadogServerConfig ParseOptions(ClientContext &context, const Value &opt
 		config.schema_name = legacy_schema_name;
 	}
 	bool has_table_name = ReadOption(options, "table_name", config.table_name);
+	ReadOption(options, "metrics_table_name", config.metrics_table_name);
 	string legacy_table_name;
 	if (ReadOption(options, "table", legacy_table_name)) {
 		if (has_table_name) {
@@ -792,8 +920,8 @@ static DatadogServerConfig ParseOptions(ClientContext &context, const Value &opt
 		config.api_key = GetDatadogCredentials(context, secret_name).api_key;
 	}
 	static const std::unordered_set<string> valid = {
-	    "schema_name",          "schema",       "table_name",     "table",       "api_key", "secret",
-	    "allow_other_hostname", "create_table", "max_body_bytes", "http_threads"};
+	    "schema_name",          "schema",       "table_name",     "table",        "api_key",           "secret",
+	    "allow_other_hostname", "create_table", "max_body_bytes", "http_threads", "metrics_table_name"};
 	for (idx_t index = 0; index < StructType::GetChildCount(options.type()); index++) {
 		auto name = StructType::GetChildName(options.type(), index);
 		if (valid.find(StringUtil::Lower(name)) == valid.end()) {

@@ -507,6 +507,95 @@ string DatadogClient::SendLogs(ClientContext &context, const string &intake_body
 #endif
 }
 
+string DatadogClient::SendMetrics(ClientContext &context, const string &series_body_json) const {
+	constexpr const char *SERIES_PATH = "/api/v2/series";
+	// Metrics normally go to the API host, not the log intake host. An intake_url override still
+	// redirects them, so a local datadog_serve (which serves /api/v2/series on the same origin as
+	// /api/v2/logs) receives both signals without a second override to configure.
+	const auto base_url = intake_url.empty() ? BuildBaseUrl(site) : BuildIntakeBaseUrl(site, intake_url);
+#ifdef __EMSCRIPTEN__
+	if (context.interrupted) {
+		throw InterruptException();
+	}
+	const auto url = base_url + SERIES_PATH;
+	auto &http_util = HTTPUtil::Get(*context.db);
+	auto params = http_util.InitializeParameters(context, url);
+	params->timeout = timeout_seconds;
+	// Submitting a series is not idempotent, so never let the transport blindly retry a write whose
+	// response may have been lost.
+	params->retries = 0;
+	params->keep_alive = true;
+	params->follow_location = false;
+
+	HTTPHeaders headers;
+	headers.Insert("DD-API-KEY", api_key);
+	headers.Insert("Content-Type", "application/json");
+	headers.Insert("Accept", "application/json");
+
+	PostRequestInfo request(url, headers, *params, reinterpret_cast<const_data_ptr_t>(series_body_json.data()),
+	                        series_body_json.size());
+	request.try_request = true;
+	auto response = http_util.Request(request);
+	if (!response) {
+		throw IOException("Datadog metric submission failed through %s: no response", base_url);
+	}
+	if (!response->Success()) {
+		auto detail = BrowserHTTPErrorDetail(*response);
+		throw IOException("Datadog metric submission returned HTTP %d through %s: %s",
+		                  static_cast<uint16_t>(response->status), base_url,
+		                  detail.empty() ? "request rejected without a response body" : detail);
+	}
+	return response->body;
+#else
+	// Metric submission authenticates with the API key alone; the application key is not used.
+	duckdb_httplib_openssl::Headers headers = {
+	    {"DD-API-KEY", api_key},
+	    {"Accept", "application/json"},
+	};
+
+	auto connection = make_uniq<duckdb_httplib_openssl::Client>(base_url);
+	connection->set_connection_timeout(static_cast<time_t>(timeout_seconds), 0);
+	connection->set_read_timeout(static_cast<time_t>(timeout_seconds), 0);
+	connection->set_keep_alive(true);
+
+	for (uint64_t attempt = 0;; attempt++) {
+		if (context.interrupted) {
+			throw InterruptException();
+		}
+		auto response = connection->Post(SERIES_PATH, headers, series_body_json, "application/json");
+
+		if (!response) {
+			auto error = response.error();
+			// The socket may be half-dead after a transport error; retry on a fresh connection.
+			connection = make_uniq<duckdb_httplib_openssl::Client>(base_url);
+			connection->set_connection_timeout(static_cast<time_t>(timeout_seconds), 0);
+			connection->set_read_timeout(static_cast<time_t>(timeout_seconds), 0);
+			connection->set_keep_alive(true);
+			// Only pre-send failures are safe to retry on this non-idempotent write endpoint.
+			if (attempt >= retries || !IsPreSendTransportError(error)) {
+				throw IOException("Datadog metric submission to %s failed: %s", base_url,
+				                  duckdb_httplib_openssl::to_string(error));
+			}
+			SleepCheckingInterrupt(context, MinValue<uint64_t>(uint64_t(1) << attempt, 60));
+			continue;
+		}
+
+		if (response->status == 429 && attempt < retries) {
+			SleepCheckingInterrupt(context, RateLimitRetryDelaySeconds(*response, attempt));
+			continue;
+		}
+		if (response->status >= 500 && attempt < retries) {
+			SleepCheckingInterrupt(context, MinValue<uint64_t>(uint64_t(1) << attempt, 60));
+			continue;
+		}
+		if (response->status < 200 || response->status >= 300) {
+			throw IOException("Datadog metric submission returned HTTP %d: %s", response->status, response->body);
+		}
+		return response->body;
+	}
+#endif
+}
+
 string DatadogClient::SendTraces(ClientContext &context, const string &traces_body_json, idx_t trace_count) const {
 	constexpr const char *TRACES_PATH = "/v0.3/traces";
 	const auto base_url = BuildTraceAgentBaseUrl(trace_agent_url);

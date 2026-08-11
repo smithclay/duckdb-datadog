@@ -513,6 +513,48 @@ SELECT count(*) FROM received;  -- the logs, round-tripped without leaving the p
 This makes the whole send path testable offline; `test/sql/datadog_send_local.test` is exactly
 this loop. Reads (`read_datadog_logs` and friends) are unaffected by `INTAKE_URL`.
 
+## Sending metrics
+
+`send_datadog_metrics` submits an OTLP-shaped gauge table to
+[`POST /api/v2/series`](https://docs.datadoghq.com/api/latest/metrics/#submit-metrics). Each
+accepted row returns `'ok'`:
+
+```sql
+SELECT send_datadog_metrics(m) FROM my_metrics m;          -- default secret
+SELECT send_datadog_metrics(m, 'dd_prod') FROM my_metrics m;
+```
+
+The column mapping mirrors the 17-column gauge shape `read_datadog_metrics` returns:
+
+| Struct column (first match wins) | Series field |
+|---|---|
+| `name` / `metric` / `metric_name` | `metric` (required, non-empty) |
+| `double_value` / `value` | the point's `value` (required; a NULL reading sends no point) |
+| `time_unix_nano` / `timestamp` | the point's `timestamp`, epoch seconds |
+| `unit` | `unit`, passed through unchanged |
+| `service_name` | a `service:` tag |
+| `metric_attributes` / `attributes` | one `key:value` tag per entry |
+| `ddtags` | comma-separated tags, appended as-is |
+
+Everything is submitted as a **gauge** (`type: 3`). Tags are Datadog's only per-point dimension
+mechanism, so `service_name` and every attribute collapse into them.
+
+Two constraints worth knowing before backfilling:
+
+- **Metric timestamps cannot be more than one hour in the past** (or ten minutes in the future).
+  Datadog silently drops points outside that window, so a historical replay must be re-anchored to
+  land inside it — this is a much tighter window than the log intake's ~18 hours.
+- **Submission is not idempotent** and carries no request id, so only pre-send transport failures
+  and definite throttling responses are retried; ambiguous failures surface rather than risk
+  double-counting. Batches are capped at 1000 points and held under the 5 MB body limit, so earlier
+  batches may already be stored if a later one fails.
+
+Metrics normally go to the API host rather than the log intake host, but an `INTAKE_URL` override
+redirects them too — `datadog_serve` serves `/api/v2/series` on the same origin as `/api/v2/logs`,
+so one local listener receives both signals and the round trip stays offline. Received points land
+in `datadog_metric_series` as `(metric, timestamp_seconds, value, type, unit, tags)`, one row per
+point, with `tags` a `VARCHAR[]` so filtering needs no json extension.
+
 ## Traces
 
 ### Reading spans

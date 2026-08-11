@@ -75,6 +75,10 @@ struct DatadogClient {
 	string AggregateLogs(ClientContext &context, const string &request_body_json) const;
 	//! GET one v1 metrics query window; the query text is percent-encoded by the client.
 	string QueryMetrics(ClientContext &context, const string &query, int64_t from, int64_t to) const;
+	//! POST a metric series payload to https://api.<site>/api/v2/series. Unlike logs, metrics go to
+	//! the API host rather than the log intake host, and authenticate with the API key alone.
+	//! Non-idempotent: only pre-send transport failures and definite throttling are retried.
+	string SendMetrics(ClientContext &context, const string &series_body_json) const;
 
 	//! GET one page of currently triggered monitor groups (Alert, Warn, or No Data) from
 	//! /api/v1/monitor/groups/search. The returned JSON is parsed by the catalog table scan.

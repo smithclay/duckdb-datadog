@@ -39,7 +39,7 @@ set(EXTENSION_SOURCES src/datadog_extension.cpp src/datadog_secret.cpp
                       src/service_dependencies_table.cpp
                       src/traces_table.cpp
                       src/datadog_catalog.cpp
-                      src/send_logs.cpp src/write_traces.cpp
+                      src/send_logs.cpp src/send_metrics.cpp src/write_traces.cpp
                       src/datadog_trace_proto.cpp
                       src/datadog_server.cpp)
 

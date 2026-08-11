@@ -9,6 +9,7 @@
 #include "logs_table.hpp"
 #include "metrics_table.hpp"
 #include "send_logs.hpp"
+#include "send_metrics.hpp"
 #include "service_dependencies_table.hpp"
 #include "traces_table.hpp"
 #include "write_traces.hpp"
@@ -34,6 +35,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RegisterDatadogTracesFunction(loader);
 	// Sender: SELECT send_datadog_logs(l) FROM logs l.
 	RegisterDatadogSendLogsFunction(loader);
+	RegisterDatadogSendMetricsFunction(loader);
 	// Traces sender (to a Datadog Agent): SELECT write_datadog_traces(t) FROM spans t.
 	RegisterDatadogWriteTracesFunction(loader);
 	// Native live intake: SELECT datadog_serve([uri [, options_struct]]).
